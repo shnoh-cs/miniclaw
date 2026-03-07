@@ -1,0 +1,86 @@
+# OpenClaw-Py Configuration
+
+[models]
+default = "gpt-oss-120b"
+compaction = "gpt-oss-7b"           # lighter model for summarization
+embedding = "bge-m3"
+
+[models.options.gpt-oss-120b]
+tool_mode = "auto"                   # "auto" | "native" | "prompt"
+max_tokens = 32768
+thinking = "adaptive"                # "off" | "minimal" | "low" | "medium" | "high"
+
+[models.options.gpt-oss-7b]
+tool_mode = "prompt"
+max_tokens = 8192
+thinking = "off"
+
+[endpoints.llm]
+base_url = "http://vllm.internal:8000/v1"
+api_key = "internal-key"
+
+[endpoints.embedding]
+base_url = "http://vllm.internal:8001/v1"
+api_key = "internal-key"
+
+[context]
+max_tokens = 32768
+compaction_threshold = 0.7           # trigger compaction at 70% usage
+reserve_tokens_floor = 20000        # minimum headroom before compaction
+tool_result_max_ratio = 0.3         # single tool result max 30% of context
+
+[session]
+dir = "~/.openclaw-py/sessions"
+
+[memory]
+dir = "~/.openclaw-py/memory"
+chunk_size = 700
+chunk_overlap = 80
+
+[memory.hybrid]
+enabled = true
+vector_weight = 0.7
+text_weight = 0.3
+
+[memory.hybrid.mmr]
+enabled = true
+lambda_param = 0.7
+
+[memory.hybrid.temporal_decay]
+enabled = true
+half_life_days = 30
+
+[memory.cache]
+enabled = true
+max_entries = 50000
+
+[pruning]
+mode = "cache-ttl"                   # "cache-ttl" | "off"
+ttl_seconds = 300                    # 5 minutes
+keep_last_assistants = 3
+soft_trim_chars = 4000
+hard_clear_ratio = 0.5
+min_prunable_tool_chars = 50000
+
+[compaction]
+mode = "safeguard"                   # "default" | "safeguard"
+identifier_policy = "strict"         # "strict" | "off" | "custom"
+max_retries = 3
+
+[compaction.memory_flush]
+enabled = true
+soft_threshold_tokens = 4000
+
+[bootstrap]
+max_chars_per_file = 20000
+max_chars_total = 150000
+head_ratio = 0.7
+tail_ratio = 0.2
+
+[skills]
+dirs = ["~/.openclaw-py/skills"]
+max_skills_in_prompt = 150
+max_prompt_chars = 30000
+
+[workspace]
+dir = "~/.openclaw-py/workspace"
