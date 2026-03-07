@@ -326,7 +326,7 @@ class ModelProvider:
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PATTERN = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>)?",
+    r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)",
     re.DOTALL,
 )
 
