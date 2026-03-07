@@ -108,8 +108,38 @@ class ModelProvider:
 
         try:
             stream = await self.client.chat.completions.create(**kwargs)
+            # Accumulate tool calls across chunks (streaming sends them in parts)
+            pending_tool_calls: dict[int, dict[str, str]] = {}  # index → {id, name, arguments}
             async for chunk in stream:
-                yield self._parse_chunk(chunk, use_native)
+                parsed = self._parse_chunk(chunk, native=False)  # never parse tool calls per-chunk
+                # Accumulate streamed tool call deltas
+                if use_native and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in pending_tool_calls:
+                                pending_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc_delta.id:
+                                pending_tool_calls[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    pending_tool_calls[idx]["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    pending_tool_calls[idx]["arguments"] += tc_delta.function.arguments
+                    # On finish, emit accumulated tool calls
+                    if chunk.choices[0].finish_reason == "tool_calls":
+                        for idx in sorted(pending_tool_calls):
+                            tc = pending_tool_calls[idx]
+                            try:
+                                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                            except json.JSONDecodeError:
+                                args = {}
+                            parsed.tool_calls.append(
+                                ToolUseBlock(id=tc["id"], name=tc["name"], input=args)
+                            )
+                        pending_tool_calls.clear()
+                yield parsed
         except Exception as e:
             err_str = str(e)
             # If native tool calling failed, retry with prompt mode
@@ -184,7 +214,10 @@ class ModelProvider:
         for msg in messages:
             api_msg = self._convert_message(msg, native)
             if api_msg:
-                api_msgs.append(api_msg)
+                if isinstance(api_msg, list):
+                    api_msgs.extend(api_msg)  # multiple tool results
+                else:
+                    api_msgs.append(api_msg)
 
         return api_msgs
 
@@ -201,14 +234,15 @@ class ModelProvider:
             if tool_results:
                 # In native mode, send as tool messages
                 if native:
-                    results = []
-                    for tr in tool_results:
-                        results.append({
+                    # Return list of tool messages (handled by _build_api_messages)
+                    return [
+                        {
                             "role": "tool",
                             "tool_call_id": tr.tool_use_id,
                             "content": tr.content,
-                        })
-                    return results[0] if len(results) == 1 else None  # handled below
+                        }
+                        for tr in tool_results
+                    ]
                 else:
                     # In prompt mode, include as text
                     parts = []
