@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
 from openclaw.config import MemoryConfig
 from openclaw.memory.embeddings import EmbeddingProvider
 from openclaw.memory.store import MemoryChunk, MemoryStore
+
+# Candidate multiplier: fetch max_results * N candidates for hybrid search
+# before MMR re-ranking. Matches the original OpenClaw default of 4.
+_CANDIDATE_MULTIPLIER = 4
 
 
 @dataclass
@@ -36,18 +40,47 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 def bm25_rank_to_score(rank: float) -> float:
     """Convert BM25 rank to 0..1 score."""
-    return 1.0 / (1.0 + max(0, abs(rank)))
+    normalized = max(0, abs(rank)) if math.isfinite(rank) else 999.0
+    return 1.0 / (1.0 + normalized)
+
+
+def _tokenize_for_jaccard(text: str) -> set[str]:
+    """Tokenize text into alphanumeric+underscore tokens for Jaccard similarity."""
+    return set(re.findall(r"[a-z0-9_]+", text.lower()))
 
 
 def _jaccard_similarity(a: str, b: str) -> float:
     """Jaccard text similarity on tokenized content."""
-    tokens_a = set(a.lower().split())
-    tokens_b = set(b.lower().split())
+    tokens_a = _tokenize_for_jaccard(a)
+    tokens_b = _tokenize_for_jaccard(b)
+    if not tokens_a and not tokens_b:
+        return 1.0
     if not tokens_a or not tokens_b:
         return 0.0
-    intersection = tokens_a & tokens_b
-    union = tokens_a | tokens_b
-    return len(intersection) / len(union)
+    # Iterate over the smaller set for efficiency
+    smaller, larger = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    intersection_size = sum(1 for t in smaller if t in larger)
+    union_size = len(tokens_a) + len(tokens_b) - intersection_size
+    return intersection_size / union_size if union_size > 0 else 0.0
+
+
+def _normalize_scores(results: list[SearchResult]) -> None:
+    """Min-max normalize final_score to [0,1] in-place.
+
+    This ensures the relevance vs diversity tradeoff in MMR is fair,
+    since Jaccard similarity is already in [0,1].
+    """
+    if len(results) <= 1:
+        return
+    min_score = min(r.final_score for r in results)
+    max_score = max(r.final_score for r in results)
+    score_range = max_score - min_score
+    if score_range == 0:
+        for r in results:
+            r.final_score = 1.0
+        return
+    for r in results:
+        r.final_score = (r.final_score - min_score) / score_range
 
 
 def apply_mmr(
@@ -57,10 +90,36 @@ def apply_mmr(
 ) -> list[SearchResult]:
     """Maximal Marginal Relevance re-ranking for diversity.
 
+    Scores are min-max normalized to [0,1] before applying MMR so that the
+    relevance vs diversity tradeoff is balanced (Jaccard is already [0,1]).
+
     λ × relevance − (1−λ) × max_similarity_to_selected
+
+    Uses original (pre-normalization) score as tiebreaker when MMR scores
+    are equal, matching the original OpenClaw implementation.
     """
     if len(results) <= 1:
         return results
+
+    # Clamp lambda to valid range
+    clamped_lambda = max(0.0, min(1.0, lambda_param))
+
+    # If lambda is 1, just return sorted by relevance (no diversity penalty)
+    if clamped_lambda == 1.0:
+        return sorted(results, key=lambda r: r.final_score, reverse=True)[:max_results]
+
+    # Save original scores for tiebreaking before normalization
+    original_scores: dict[int, float] = {}
+    for r in results:
+        original_scores[id(r)] = r.final_score
+
+    # Min-max normalize to [0,1] for fair comparison with Jaccard similarity
+    _normalize_scores(results)
+
+    # Pre-tokenize all items for efficiency
+    token_cache: dict[int, set[str]] = {}
+    for r in results:
+        token_cache[id(r)] = _tokenize_for_jaccard(r.chunk.text)
 
     selected: list[SearchResult] = []
     remaining = list(results)
@@ -68,25 +127,45 @@ def apply_mmr(
     while remaining and len(selected) < max_results:
         best_idx = -1
         best_mmr = -float("inf")
+        best_original_score = -float("inf")
 
         for i, candidate in enumerate(remaining):
             relevance = candidate.final_score
 
             # Max similarity to already selected
             max_sim = 0.0
+            candidate_tokens = token_cache[id(candidate)]
             for sel in selected:
-                sim = _jaccard_similarity(candidate.chunk.text, sel.chunk.text)
+                sel_tokens = token_cache[id(sel)]
+                # Inline Jaccard for cached tokens
+                if not candidate_tokens and not sel_tokens:
+                    sim = 1.0
+                elif not candidate_tokens or not sel_tokens:
+                    sim = 0.0
+                else:
+                    smaller, larger = (candidate_tokens, sel_tokens) if len(candidate_tokens) <= len(sel_tokens) else (sel_tokens, candidate_tokens)
+                    isect = sum(1 for t in smaller if t in larger)
+                    union = len(candidate_tokens) + len(sel_tokens) - isect
+                    sim = isect / union if union > 0 else 0.0
                 max_sim = max(max_sim, sim)
 
-            mmr = lambda_param * relevance - (1 - lambda_param) * max_sim
-            if mmr > best_mmr:
+            mmr = clamped_lambda * relevance - (1 - clamped_lambda) * max_sim
+            orig_score = original_scores[id(candidate)]
+
+            # Use original score as tiebreaker when MMR scores are equal
+            if mmr > best_mmr or (mmr == best_mmr and orig_score > best_original_score):
                 best_mmr = mmr
                 best_idx = i
+                best_original_score = orig_score
 
         if best_idx >= 0:
             selected.append(remaining.pop(best_idx))
         else:
             break
+
+    # Restore original scores so callers see meaningful values
+    for r in selected:
+        r.final_score = original_scores[id(r)]
 
     return selected
 
@@ -125,28 +204,216 @@ def apply_temporal_decay(
     return results
 
 
+# --------------------------------------------------------------------------- #
+# Multi-language stop words (mirrors OpenClaw query-expansion.ts)
+# --------------------------------------------------------------------------- #
+
+_STOP_WORDS_EN: set[str] = {
+    # Articles and determiners
+    "a", "an", "the", "this", "that", "these", "those",
+    # Pronouns
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "they", "them",
+    # Common verbs
+    "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "can", "may", "might",
+    # Prepositions
+    "in", "on", "at", "to", "for", "of", "with", "by", "from",
+    "about", "into", "through", "during", "before", "after",
+    "above", "below", "between", "under", "over",
+    # Conjunctions
+    "and", "or", "but", "if", "then", "because", "as", "while",
+    "when", "where", "what", "which", "who", "how", "why",
+    # Time references (vague)
+    "yesterday", "today", "tomorrow", "earlier", "later",
+    "recently", "ago", "just", "now",
+    # Vague references
+    "thing", "things", "stuff", "something", "anything", "everything", "nothing",
+    # Question/request words
+    "please", "help", "find", "show", "get", "tell", "give",
+}
+
+_STOP_WORDS_KO: set[str] = {
+    # Particles (조사)
+    "은", "는", "이", "가", "을", "를", "의", "에", "에서",
+    "로", "으로", "와", "과", "도", "만", "까지", "부터",
+    "한테", "에게", "께", "처럼", "같이", "보다", "마다", "밖에", "대로",
+    # Pronouns (대명사)
+    "나", "나는", "내가", "나를", "너", "우리", "저", "저희",
+    "그", "그녀", "그들", "이것", "저것", "그것", "여기", "저기", "거기",
+    # Common verbs / auxiliaries
+    "있다", "없다", "하다", "되다", "이다", "아니다",
+    "보다", "주다", "오다", "가다",
+    # Nouns (의존 명사 / vague)
+    "것", "거", "등", "수", "때", "곳", "중", "분",
+    # Adverbs
+    "잘", "더", "또", "매우", "정말", "아주", "많이", "너무", "좀",
+    # Conjunctions
+    "그리고", "하지만", "그래서", "그런데", "그러나", "또는", "그러면",
+    # Question words
+    "왜", "어떻게", "뭐", "언제", "어디", "누구", "무엇", "어떤",
+    # Time (vague)
+    "어제", "오늘", "내일", "최근", "지금", "아까", "나중", "전에",
+    # Request words
+    "제발", "부탁",
+}
+
+_STOP_WORDS_ZH: set[str] = {
+    # Pronouns
+    "我", "我们", "你", "你们", "他", "她", "它", "他们",
+    "这", "那", "这个", "那个", "这些", "那些",
+    # Auxiliary words
+    "的", "了", "着", "过", "得", "地", "吗", "呢", "吧", "啊", "呀", "嘛", "啦",
+    # Common verbs
+    "是", "有", "在", "被", "把", "给", "让", "用", "到", "去", "来", "做", "说",
+    "看", "找", "想", "要", "能", "会", "可以",
+    # Prepositions and conjunctions
+    "和", "与", "或", "但", "但是", "因为", "所以", "如果", "虽然",
+    "而", "也", "都", "就", "还", "又", "再", "才", "只",
+    # Time (vague)
+    "之前", "以前", "之后", "以后", "刚才", "现在", "昨天", "今天", "明天", "最近",
+    # Vague references
+    "东西", "事情", "事", "什么", "哪个", "哪些", "怎么", "为什么", "多少",
+    # Request words
+    "请", "帮", "帮忙", "告诉",
+}
+
+_STOP_WORDS_JA: set[str] = {
+    "これ", "それ", "あれ", "この", "その", "あの", "ここ", "そこ", "あそこ",
+    "する", "した", "して", "です", "ます", "いる", "ある", "なる", "できる",
+    "の", "こと", "もの", "ため", "そして", "しかし", "また", "でも", "から", "まで",
+    "より", "だけ",
+    "なぜ", "どう", "何", "いつ", "どこ", "誰", "どれ",
+    "昨日", "今日", "明日", "最近", "今", "さっき", "前", "後",
+}
+
+# All stop words merged for fast lookup
+_ALL_STOP_WORDS: set[str] = _STOP_WORDS_EN | _STOP_WORDS_KO | _STOP_WORDS_ZH | _STOP_WORDS_JA
+
+# Korean trailing particles sorted by descending length for longest-match-first stripping
+_KO_TRAILING_PARTICLES: list[str] = sorted(
+    [
+        "에서", "으로", "에게", "한테", "처럼", "같이", "보다", "까지", "부터",
+        "마다", "밖에", "대로",
+        "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도", "만",
+    ],
+    key=len,
+    reverse=True,
+)
+
+# Regex for CJK character ranges (unified CJK, Hangul syllables, Hiragana, Katakana)
+_CJK_RANGE = re.compile(r"[\u4e00-\u9fff\uac00-\ud7af\u3040-\u30ff]")
+_HANGUL_RANGE = re.compile(r"[\uac00-\ud7af\u3131-\u3163]")
+_CJK_UNIFIED = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _strip_korean_trailing_particle(token: str) -> str | None:
+    """Strip common Korean particles from word end, returning the stem or None."""
+    for particle in _KO_TRAILING_PARTICLES:
+        if len(token) > len(particle) and token.endswith(particle):
+            return token[: -len(particle)]
+    return None
+
+
+def _is_useful_korean_stem(stem: str) -> bool:
+    """Prevent bogus one-syllable stems; keep 2+ syllable Hangul or ASCII."""
+    if _HANGUL_RANGE.search(stem):
+        return len(stem) >= 2
+    return bool(re.match(r"^[a-z0-9_]+$", stem, re.IGNORECASE))
+
+
+def _is_valid_keyword(token: str) -> bool:
+    """Check if a token looks like a meaningful keyword."""
+    if not token:
+        return False
+    # Skip very short English words
+    if re.match(r"^[a-zA-Z]+$", token) and len(token) < 3:
+        return False
+    # Skip pure numbers
+    if re.match(r"^\d+$", token):
+        return False
+    # Skip all-punctuation
+    if re.match(r"^[\W]+$", token) and not _CJK_RANGE.search(token):
+        return False
+    return True
+
+
 def expand_query(query: str) -> str:
-    """Simple keyword expansion for improved search.
+    """Extract keywords from a query for FTS search.
 
-    Extracts potential keywords from the query for BM25 matching.
+    Handles English, Korean, Chinese, and Japanese text.
+    Removes stop words, strips Korean trailing particles,
+    and extracts CJK character bigrams for better matching.
     """
-    # Remove common stop words and extract meaningful terms
-    stop_words = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been",
-        "being", "have", "has", "had", "do", "does", "did", "will",
-        "would", "could", "should", "may", "might", "can", "shall",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from",
-        "as", "into", "about", "like", "through", "after", "before",
-        "between", "under", "above", "up", "down", "out", "off",
-        "over", "then", "than", "that", "this", "these", "those",
-        "what", "which", "who", "when", "where", "how", "why",
-        "and", "or", "but", "not", "no", "if", "it", "its", "my",
-        "your", "his", "her", "our", "their",
-    }
+    tokens = _tokenize_query(query)
+    seen: set[str] = set()
+    keywords: list[str] = []
 
-    words = query.lower().split()
-    keywords = [w for w in words if w not in stop_words and len(w) > 2]
+    for token in tokens:
+        if token in _ALL_STOP_WORDS:
+            continue
+        if not _is_valid_keyword(token):
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        keywords.append(token)
+
     return " ".join(keywords) if keywords else query
+
+
+def _tokenize_query(text: str) -> list[str]:
+    """Tokenize text for query expansion, handling CJK scripts.
+
+    For Chinese characters: extract unigrams + bigrams.
+    For Korean: keep words, strip trailing particles, emit stems.
+    For other text: split on whitespace/punctuation.
+    """
+    tokens: list[str] = []
+    normalized = text.lower().strip()
+    # Split into segments on whitespace and punctuation
+    segments = re.split(r"[\s\p{P}]+", normalized, flags=re.UNICODE)
+
+    for segment in segments:
+        if not segment:
+            continue
+
+        if _HANGUL_RANGE.search(segment):
+            # Korean: keep word if not a stop word, also emit particle-stripped stem
+            stem = _strip_korean_trailing_particle(segment)
+            stem_is_stop = stem is not None and stem in _STOP_WORDS_KO
+            if segment not in _STOP_WORDS_KO and not stem_is_stop:
+                tokens.append(segment)
+            if stem and stem not in _STOP_WORDS_KO and _is_useful_korean_stem(stem):
+                tokens.append(stem)
+        elif _CJK_UNIFIED.search(segment):
+            # Chinese / CJK unified: extract chars + bigrams
+            chars = [c for c in segment if _CJK_UNIFIED.match(c)]
+            tokens.extend(chars)
+            for i in range(len(chars) - 1):
+                tokens.append(chars[i] + chars[i + 1])
+        else:
+            # Non-CJK: keep as single token
+            tokens.append(segment)
+
+    return tokens
+
+
+def build_fts_query(raw: str) -> str | None:
+    """Build a safe FTS5 query from raw user input.
+
+    Tokenizes with a proper pattern (alphanumeric + underscore sequences),
+    wraps each token in quotes, and joins with AND.
+    Returns None if no valid tokens are found.
+    """
+    # Match alphanumeric + underscore sequences, plus CJK characters
+    tokens = re.findall(r"[\w\u4e00-\u9fff\uac00-\ud7af\u3040-\u30ff]+", raw, re.UNICODE)
+    tokens = [t.strip() for t in tokens if t.strip()]
+    if not tokens:
+        return None
+    # Quote each token and join with AND for FTS5
+    quoted = ['"' + t.replace('"', "") + '"' for t in tokens]
+    return " AND ".join(quoted)
 
 
 class MemorySearcher:
@@ -168,7 +435,13 @@ class MemorySearcher:
         max_results: int = 10,
     ) -> list[SearchResult]:
         """Perform hybrid search (vector + BM25) with MMR and temporal decay."""
+        # Guard: return empty results for blank/whitespace queries
+        if not query or not query.strip():
+            return []
+
         hybrid = self.config.hybrid
+        # Use 4x candidate multiplier (matching original OpenClaw)
+        candidates = min(200, max(1, max_results * _CANDIDATE_MULTIPLIER))
 
         results_by_id: dict[int, SearchResult] = {}
 
@@ -185,7 +458,7 @@ class MemorySearcher:
                     scores.append((chunk_id, sim))
 
                 scores.sort(key=lambda x: x[1], reverse=True)
-                top_vector = scores[:max_results * 2]
+                top_vector = scores[:candidates]
 
                 chunk_ids = [cid for cid, _ in top_vector]
                 chunks = self.store.get_chunks_by_ids(chunk_ids)
@@ -202,8 +475,17 @@ class MemorySearcher:
 
         # 2. BM25 keyword search
         if hybrid.enabled:
-            expanded_query = expand_query(query)
-            bm25_results = self.store.bm25_search(expanded_query, limit=max_results * 2)
+            # Build a safe FTS5 query; fall back to expanded keywords
+            fts_query = build_fts_query(query)
+            if fts_query is None:
+                # No valid tokens — use expanded keywords as fallback
+                expanded = expand_query(query)
+                fts_query = build_fts_query(expanded)
+
+            if fts_query:
+                bm25_results = self.store.bm25_search(fts_query, limit=candidates)
+            else:
+                bm25_results = []
 
             if bm25_results:
                 bm25_ids = [cid for cid, _ in bm25_results]
@@ -247,7 +529,7 @@ class MemorySearcher:
 
         return all_results[:max_results]
 
-    async def index_file(self, file_path: Path, chunk_size: int = 700, overlap: int = 80) -> int:
+    async def index_file(self, file_path: Path, chunk_size: int = 1600, overlap: int = 320) -> int:
         """Index a markdown file into the store. Returns number of chunks created."""
         if not file_path.exists():
             return 0

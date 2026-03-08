@@ -261,10 +261,14 @@ class RunResult(BaseModel):
 
 class FailoverReason(str, Enum):
     AUTH = "auth"
+    AUTH_PERMANENT = "auth_permanent"
     BILLING = "billing"
     RATE_LIMIT = "rate_limit"
+    OVERLOADED = "overloaded"
     TIMEOUT = "timeout"
     CONTEXT_OVERFLOW = "context_overflow"
     MODEL_NOT_FOUND = "model_not_found"
+    FORMAT = "format"
+    SESSION_EXPIRED = "session_expired"
     TRANSIENT = "transient"
     UNKNOWN = "unknown"

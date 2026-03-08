@@ -81,8 +81,9 @@ class MemoryCacheConfig(BaseModel):
 
 class MemoryConfig(BaseModel):
     dir: str = "~/.openclaw-py/memory"
-    chunk_size: int = 700
-    chunk_overlap: int = 80
+    # Original OpenClaw uses 400 tokens (~1600 chars) with 80 token (~320 char) overlap
+    chunk_size: int = 1600
+    chunk_overlap: int = 320
     hybrid: HybridConfig = Field(default_factory=HybridConfig)
     cache: MemoryCacheConfig = Field(default_factory=MemoryCacheConfig)
 

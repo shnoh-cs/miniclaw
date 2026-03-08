@@ -15,6 +15,15 @@ from openclaw.agent.types import (
 if TYPE_CHECKING:
     from openclaw.config import PruningConfig
 
+# Approximate char cost for an image block in context budget estimation.
+IMAGE_CHAR_ESTIMATE = 8_000
+
+# Ratio-based gate: pruning activates when context utilization exceeds this fraction
+# of the context window (chars = context_window_tokens * CHARS_PER_TOKEN_ESTIMATE).
+CHARS_PER_TOKEN_ESTIMATE = 4
+DEFAULT_SOFT_TRIM_RATIO = 0.3
+DEFAULT_HARD_CLEAR_RATIO = 0.5
+
 
 class PruningState:
     """Tracks the last API call time for TTL-based cache pruning."""
@@ -36,14 +45,29 @@ def _has_images(msg: AgentMessage) -> bool:
     return any(isinstance(b, ImageBlock) for b in msg.content)
 
 
-def _total_tool_result_chars(messages: list[AgentMessage]) -> int:
-    """Calculate total characters in tool result blocks."""
+def _estimate_message_chars(msg: AgentMessage) -> int:
+    """Estimate the character cost of a message, counting images as IMAGE_CHAR_ESTIMATE."""
     total = 0
-    for msg in messages:
-        for block in msg.content:
-            if isinstance(block, ToolResultBlock):
-                total += len(block.content)
+    for block in msg.content:
+        if isinstance(block, ToolResultBlock):
+            total += len(block.content)
+        elif isinstance(block, ImageBlock):
+            total += IMAGE_CHAR_ESTIMATE
+        elif isinstance(block, TextBlock):
+            total += len(block.text)
+        else:
+            # ToolUseBlock — rough estimate of serialized arguments.
+            try:
+                import json
+                total += len(json.dumps(block.input))  # type: ignore[union-attr]
+            except Exception:
+                total += 128
     return total
+
+
+def _estimate_context_chars(messages: list[AgentMessage]) -> int:
+    """Total estimated chars across all messages (images counted at IMAGE_CHAR_ESTIMATE)."""
+    return sum(_estimate_message_chars(m) for m in messages)
 
 
 def _soft_trim_result(block: ToolResultBlock, head: int = 1500, tail: int = 1500) -> ToolResultBlock:
@@ -72,10 +96,45 @@ def _hard_clear_result(block: ToolResultBlock) -> ToolResultBlock:
     )
 
 
+def _find_first_user_index(messages: list[AgentMessage]) -> int | None:
+    """Return the index of the first user message, or None if there are no user messages."""
+    for i, msg in enumerate(messages):
+        if msg.role == "user":
+            return i
+    return None
+
+
+def _find_assistant_cutoff_index(
+    messages: list[AgentMessage],
+    keep_last_assistants: int,
+) -> int | None:
+    """Find the index of the Nth-from-last assistant message.
+
+    Everything from this index onward (a contiguous protected tail) is shielded
+    from pruning. Returns None when there are not enough assistant messages to
+    establish a protected tail.
+    """
+    if keep_last_assistants <= 0:
+        return len(messages)
+
+    remaining = keep_last_assistants
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].role != "assistant":
+            continue
+        remaining -= 1
+        if remaining == 0:
+            return i
+
+    # Not enough assistant messages to establish a protected tail.
+    return None
+
+
 def prune_messages(
     messages: list[AgentMessage],
     config: PruningConfig,
     state: PruningState,
+    *,
+    context_window_tokens: int = 0,
 ) -> list[AgentMessage]:
     """Prune old tool results from messages (in-memory only).
 
@@ -83,12 +142,22 @@ def prune_messages(
 
     Two-tier strategy:
     1. Soft-trim: truncate large tool results to head+tail
-    2. Hard-clear: replace entire results with placeholder
+    2. Hard-clear: iteratively replace oldest prunable results with placeholder,
+       rechecking ratio after each, stopping once under threshold
 
     Only activates when:
     - mode is "cache-ttl"
     - TTL has expired since last API call
+    - Context utilization ratio exceeds softTrimRatio (default 0.3)
     - Total prunable tool content exceeds minimum threshold
+
+    Parameters
+    ----------
+    context_window_tokens:
+        The model's context window size in tokens.  When >0 the pruning gate
+        uses ratio-based thresholds (softTrimRatio / hardClearRatio) against
+        ``context_window_tokens * CHARS_PER_TOKEN_ESTIMATE``.  Falls back to
+        the legacy absolute-char mode when 0.
     """
     if config.mode != "cache-ttl":
         return messages
@@ -96,51 +165,121 @@ def prune_messages(
     if not state.is_ttl_expired(config.ttl_seconds):
         return messages  # cache still fresh
 
-    total_tool_chars = _total_tool_result_chars(messages)
-    if total_tool_chars < config.min_prunable_tool_chars:
-        return messages  # not enough to prune
+    # Compute char window for ratio-based gating.
+    if context_window_tokens > 0:
+        char_window = context_window_tokens * CHARS_PER_TOKEN_ESTIMATE
+    else:
+        # Legacy fallback: derive from config.  Use a generous estimate so the
+        # ratio-based gate still works.
+        char_window = config.soft_trim_chars * 10 if config.soft_trim_chars > 0 else 40_000
 
-    # Protect last N assistant messages and their associated tool results
-    protected_indices: set[int] = set()
-    assistant_count = 0
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].role == "assistant":
-            assistant_count += 1
-            protected_indices.add(i)
-            # Also protect the next message (tool results)
-            if i + 1 < len(messages):
-                protected_indices.add(i + 1)
-            if assistant_count >= config.keep_last_assistants:
-                break
+    total_chars = _estimate_context_chars(messages)
+    ratio = total_chars / char_window if char_window > 0 else 1.0
 
-    # Calculate context budget for hard-clear threshold
-    context_chars = sum(
-        len(b.content) if isinstance(b, ToolResultBlock) else 0
-        for msg in messages
-        for b in msg.content
-    )
-    hard_clear_threshold = int(context_chars * config.hard_clear_ratio)
+    soft_trim_ratio = DEFAULT_SOFT_TRIM_RATIO
+    hard_clear_ratio = getattr(config, "hard_clear_ratio", DEFAULT_HARD_CLEAR_RATIO)
 
-    pruned: list[AgentMessage] = []
-    for i, msg in enumerate(messages):
-        if i in protected_indices or _has_images(msg):
-            pruned.append(msg)
+    if ratio < soft_trim_ratio:
+        return messages  # not enough context utilization to warrant pruning
+
+    # Bootstrap protection: never prune anything before the first user message.
+    # This protects initial "identity" reads (SOUL.md, USER.md, etc.) which
+    # typically happen before the first inbound user message.
+    first_user_index = _find_first_user_index(messages)
+    prune_start = first_user_index if first_user_index is not None else len(messages)
+
+    # Protected tail: contiguous tail from the Nth-from-last assistant onward.
+    cutoff_index = _find_assistant_cutoff_index(messages, config.keep_last_assistants)
+    if cutoff_index is None:
+        return messages  # not enough assistant messages to establish protected tail
+
+    # Collect prunable tool result indices.
+    prunable_indices: list[int] = []
+
+    # Build soft-trimmed output.
+    result: list[AgentMessage] | None = None
+
+    for i in range(prune_start, cutoff_index):
+        msg = messages[i]
+        if _has_images(msg):
             continue
 
+        has_tool_results = any(isinstance(b, ToolResultBlock) for b in msg.content)
+        if not has_tool_results:
+            continue
+
+        prunable_indices.append(i)
+
         new_blocks = []
+        changed = False
         for block in msg.content:
             if not isinstance(block, ToolResultBlock):
                 new_blocks.append(block)
                 continue
 
             content_len = len(block.content)
-            if content_len <= config.soft_trim_chars:
-                new_blocks.append(block)
-            elif content_len > hard_clear_threshold:
-                new_blocks.append(_hard_clear_result(block))
+            if content_len > config.soft_trim_chars:
+                trimmed = _soft_trim_result(block)
+                new_blocks.append(trimmed)
+                before_chars = content_len
+                after_chars = len(trimmed.content)
+                total_chars += after_chars - before_chars
+                changed = True
             else:
-                new_blocks.append(_soft_trim_result(block))
+                new_blocks.append(block)
 
-        pruned.append(msg.model_copy(update={"content": new_blocks}))
+        if changed:
+            if result is None:
+                result = list(messages)
+            result[i] = msg.model_copy(update={"content": new_blocks})
 
-    return pruned
+    output_after_soft = result if result is not None else messages
+
+    # Recheck ratio after soft trim.
+    ratio = total_chars / char_window if char_window > 0 else 1.0
+    if ratio < hard_clear_ratio:
+        return output_after_soft
+
+    # Check minimum prunable tool chars.
+    prunable_tool_chars = 0
+    for i in prunable_indices:
+        m = output_after_soft[i]
+        prunable_tool_chars += _estimate_message_chars(m)
+    if prunable_tool_chars < config.min_prunable_tool_chars:
+        return output_after_soft
+
+    # Iterative hard clear: clear one prunable result at a time, rechecking
+    # ratio after each, stopping once under threshold.
+    for i in prunable_indices:
+        if ratio < hard_clear_ratio:
+            break
+
+        source_msg = output_after_soft[i]
+
+        new_blocks = []
+        changed = False
+        for block in source_msg.content:
+            if not isinstance(block, ToolResultBlock):
+                new_blocks.append(block)
+                continue
+
+            before_chars = len(block.content)
+            cleared = _hard_clear_result(block)
+            after_chars = len(cleared.content)
+            if after_chars < before_chars:
+                new_blocks.append(cleared)
+                total_chars += after_chars - before_chars
+                changed = True
+            else:
+                new_blocks.append(block)
+
+        if changed:
+            if result is None:
+                result = list(messages)
+            result[i] = source_msg.model_copy(update={"content": new_blocks})
+            # Update reference for subsequent iterations.
+            output_after_soft = result  # type: ignore[assignment]
+
+        ratio = total_chars / char_window if char_window > 0 else 1.0
+
+    return result if result is not None else messages

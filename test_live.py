@@ -315,14 +315,14 @@ async def test_loop_detection(agent) -> tuple[bool, str]:
     from openclaw.tools.registry import ToolLoopDetector
 
     detector = ToolLoopDetector()
-    for i in range(10):
+    warnings: list[str] = []
+    for i in range(15):
         w = detector.record("read", {"path": "/same"}, "same content")
-        if w and "CRITICAL" in w:
-            return True, f"{i+1}회 반복 후 CRITICAL 감지"
-    # 경고만이라도
-    w = detector.record("read", {"path": "/same"}, "same content")
-    ok = w is not None
-    return ok, f"11회 반복, 경고: {(w or '')[:60]}"
+        if w:
+            warnings.append(w)
+    # generic_repeat is warning-only (never CRITICAL); expect at least one warning
+    ok = len(warnings) > 0 and all("WARNING" in w for w in warnings)
+    return ok, f"15회 반복, 경고 {len(warnings)}건: {(warnings[0] if warnings else '')[:60]}"
 
 
 async def test_korean_response(agent) -> tuple[bool, str]:
