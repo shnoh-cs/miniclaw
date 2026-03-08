@@ -115,6 +115,11 @@ def _is_eligible(entry: SkillEntry) -> bool:
     return True
 
 
+def _bundled_skills_dir() -> Path:
+    """Return the path to the bundled skills directory shipped with the package."""
+    return Path(__file__).parent / "bundled"
+
+
 def load_skills(
     skill_dirs: list[Path],
     max_skills: int = 150,
@@ -124,6 +129,11 @@ def load_skills(
     Later directories in the list have higher precedence.
     Precedence: bundled → managed → personal → project → workspace
     """
+    # Prepend bundled skills (lowest precedence — user dirs can override)
+    bundled = _bundled_skills_dir()
+    if bundled.is_dir() and bundled not in skill_dirs:
+        skill_dirs = [bundled] + list(skill_dirs)
+
     skills_by_name: dict[str, SkillEntry] = {}
 
     for skill_dir in skill_dirs:

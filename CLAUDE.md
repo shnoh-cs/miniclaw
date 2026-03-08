@@ -48,7 +48,8 @@ openclaw/
 │   └── builtins/        ~900줄  Read, Write, Edit, ApplyPatch, Bash, Process,
 │                                WebFetch, PDF, Hancom, Image, Memory(3), Subagent
 ├── skills/         # 스킬 디스커버리
-│   └── loader.py        197줄  YAML frontmatter, OS/바이너리 게이팅
+│   ├── loader.py        205줄  YAML frontmatter, OS/바이너리 게이팅, 번들 스킬 자동 로드
+│   └── bundled/         번들 스킬 (nano-pdf, himalaya)
 ├── subagent/       # 서브에이전트
 │   └── spawn.py         216줄  깊이 제한(max 5), 도구 정책
 ├── hooks/          # Hook 시스템
