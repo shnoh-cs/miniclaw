@@ -7,9 +7,13 @@ overload pacing all behave identically.
 
 from __future__ import annotations
 
+import fcntl
+import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from openclaw.agent.types import FailoverReason
 
@@ -423,6 +427,73 @@ class ProfileCooldown:
 
 
 # ---------------------------------------------------------------------------
+# API key rotation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ApiKeyRotator:
+    """Manages multiple API keys for a single provider with round-robin
+    rotation and per-key cooldown tracking.
+
+    Usage::
+
+        rotator = ApiKeyRotator(keys=["sk-aaa", "sk-bbb", "sk-ccc"])
+        key = rotator.get_current_key()
+        # ... on rate-limit error:
+        rotator.rotate_on_error(reason)
+        key = rotator.get_current_key()
+    """
+
+    keys: list[str] = field(default_factory=list)
+    _cooldowns: dict[int, ProfileCooldown] = field(default_factory=dict)
+    _current_idx: int = 0
+
+    def get_current_key(self) -> str | None:
+        """Return the current active key, skipping keys in cooldown.
+
+        Returns None if all keys are in cooldown.
+        """
+        if not self.keys:
+            return None
+
+        # Clear expired cooldowns first.
+        for cd in self._cooldowns.values():
+            cd.clear_if_expired()
+
+        # Try each key starting from current index.
+        for _ in range(len(self.keys)):
+            cd = self._cooldowns.get(self._current_idx)
+            if cd is None or not cd.is_in_cooldown:
+                return self.keys[self._current_idx]
+            self._current_idx = (self._current_idx + 1) % len(self.keys)
+
+        return None  # all keys in cooldown
+
+    def rotate_on_error(self, reason: FailoverReason = FailoverReason.RATE_LIMIT) -> str | None:
+        """Record failure on the current key and rotate to the next available.
+
+        Returns the next available key, or None if all are in cooldown.
+        """
+        if not self.keys:
+            return None
+
+        # Mark failure on current key.
+        if self._current_idx not in self._cooldowns:
+            self._cooldowns[self._current_idx] = ProfileCooldown()
+        self._cooldowns[self._current_idx].mark_failure(reason)
+
+        # Rotate.
+        self._current_idx = (self._current_idx + 1) % len(self.keys)
+        return self.get_current_key()
+
+    def mark_success(self) -> None:
+        """Record success on the current key — clears its cooldown."""
+        if self._current_idx in self._cooldowns:
+            self._cooldowns[self._current_idx].mark_success()
+
+
+# ---------------------------------------------------------------------------
 # Overload pacing (brief backoff between rotation attempts during overload)
 # ---------------------------------------------------------------------------
 
@@ -457,6 +528,10 @@ MAX_RETRY_ITERATIONS = 32
 # FailoverManager
 # ---------------------------------------------------------------------------
 
+_DEFAULT_STATE_PATH = os.path.expanduser("~/.openclaw-py/failover_state.json")
+_DEFAULT_PROBE_INTERVAL = 30  # seconds between probe attempts
+
+
 @dataclass
 class FailoverManager:
     """Manages auth profile rotation, model failover, and retry guards."""
@@ -464,11 +539,17 @@ class FailoverManager:
     profiles: list[str] = field(default_factory=lambda: ["default"])
     fallback_models: list[str] = field(default_factory=list)
     cooldowns: dict[str, ProfileCooldown] = field(default_factory=dict)
+    state_path: str = _DEFAULT_STATE_PATH
     _current_profile_idx: int = 0
     _current_model_idx: int = -1  # -1 = primary model
     _session_pinned_profile: str | None = None
     _retry_count: int = 0
     _overload_failover_attempts: int = 0
+    _last_probe_time: float = 0.0
+    _probe_interval: int = _DEFAULT_PROBE_INTERVAL
+
+    def __post_init__(self) -> None:
+        self.load_state()
 
     @property
     def current_profile(self) -> str:
@@ -580,6 +661,7 @@ class FailoverManager:
         self.get_cooldown(profile).mark_failure(reason)
 
         if not should_failover(reason):
+            self.save_state()
             return reason, None
 
         # Overload pacing: brief sleep before trying the next profile/model.
@@ -588,6 +670,7 @@ class FailoverManager:
         # Try rotating profiles first.
         next_profile = self.advance_profile()
         if next_profile:
+            self.save_state()
             return reason, None  # same model, different profile
 
         # All profiles exhausted, try fallback model.
@@ -596,8 +679,10 @@ class FailoverManager:
             # Reset profile rotation for new model.
             self._current_profile_idx = 0
             self.unpin_profile()
+            self.save_state()
             return reason, next_model
 
+        self.save_state()
         return reason, None  # fully exhausted
 
     def mark_success(self) -> None:
@@ -608,3 +693,137 @@ class FailoverManager:
         self.pin_profile(profile)
         self._retry_count = 0
         self._overload_failover_attempts = 0
+        self.save_state()
+
+    # -------------------------------------------------------------------
+    # State persistence
+    # -------------------------------------------------------------------
+
+    def save_state(self) -> None:
+        """Persist failover state to disk (JSON) with file locking."""
+        state = {
+            "current_profile_idx": self._current_profile_idx,
+            "current_model_idx": self._current_model_idx,
+            "retry_count": self._retry_count,
+            "last_probe_time": self._last_probe_time,
+            "cooldowns": {
+                name: {
+                    "error_count": cd.error_count,
+                    "billing_error_count": cd.billing_error_count,
+                    "cooldown_until": cd.cooldown_until,
+                    "last_success": cd.last_success,
+                    "last_failure_at": cd.last_failure_at,
+                }
+                for name, cd in self.cooldowns.items()
+            },
+        }
+        path = Path(self.state_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                os.write(fd, json.dumps(state, indent=2).encode())
+                os.fsync(fd)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            os.replace(str(tmp), str(path))
+        except OSError:
+            # Best-effort: don't crash if state dir is unwritable.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def load_state(self) -> None:
+        """Load persisted failover state from disk if it exists."""
+        path = Path(self.state_path)
+        if not path.is_file():
+            return
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                raw = os.read(fd, 1_000_000)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            state = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        self._current_profile_idx = state.get("current_profile_idx", 0)
+        self._current_model_idx = state.get("current_model_idx", -1)
+        self._retry_count = state.get("retry_count", 0)
+        self._last_probe_time = state.get("last_probe_time", 0.0)
+
+        for name, cd_data in state.get("cooldowns", {}).items():
+            cd = ProfileCooldown(
+                error_count=cd_data.get("error_count", 0),
+                billing_error_count=cd_data.get("billing_error_count", 0),
+                cooldown_until=cd_data.get("cooldown_until", 0.0),
+                last_success=cd_data.get("last_success", 0.0),
+                last_failure_at=cd_data.get("last_failure_at", 0.0),
+            )
+            self.cooldowns[name] = cd
+
+    # -------------------------------------------------------------------
+    # Probe mechanism
+    # -------------------------------------------------------------------
+
+    def should_probe_primary(self) -> bool:
+        """Check whether we should probe the primary model.
+
+        Returns True when:
+        - We are currently on a fallback model (not primary).
+        - Enough time has passed since the last probe (``_probe_interval``).
+        - Either the probe interval has elapsed, or the primary's cooldown
+          will expire within 2 minutes.
+        """
+        # Only probe when we're on a fallback.
+        if self._current_model_idx < 0:
+            return False
+
+        now = time.time()
+        elapsed = now - self._last_probe_time
+        if elapsed < self._probe_interval:
+            return False
+
+        # Check if any primary profile cooldown is near expiry (within 2 min).
+        for profile in self.profiles:
+            cd = self.cooldowns.get(profile)
+            if cd is None or not cd.is_in_cooldown:
+                # A primary profile is already available — probe.
+                return True
+            remaining = cd.cooldown_until - now
+            if remaining <= 120:
+                return True
+
+        # Fallback: allow periodic probes even if cooldowns are long.
+        return elapsed >= self._probe_interval
+
+    def probe_primary(self, success: bool) -> None:
+        """Record the result of a primary-model probe.
+
+        If *success* is True, reset to primary model and clear cooldowns.
+        If False, stay on fallback and record the probe time.
+        """
+        now = time.time()
+        self._last_probe_time = now
+
+        if success:
+            # Reset to primary model.
+            self._current_model_idx = -1
+            self._current_profile_idx = 0
+            self.unpin_profile()
+            # Clear all primary profile cooldowns.
+            for profile in self.profiles:
+                cd = self.cooldowns.get(profile)
+                if cd is not None:
+                    cd.mark_success()
+            self._retry_count = 0
+            self._overload_failover_attempts = 0
+
+        self.save_state()

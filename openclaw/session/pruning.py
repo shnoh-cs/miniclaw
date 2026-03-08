@@ -10,6 +10,7 @@ from openclaw.agent.types import (
     ImageBlock,
     TextBlock,
     ToolResultBlock,
+    ToolUseBlock,
 )
 
 if TYPE_CHECKING:
@@ -96,6 +97,66 @@ def _hard_clear_result(block: ToolResultBlock) -> ToolResultBlock:
     )
 
 
+IMAGE_PRUNED_PLACEHOLDER = "[image data removed — already processed by model]"
+
+
+def prune_processed_images(
+    messages: list[AgentMessage],
+    *,
+    keep_last_turns: int = 2,
+) -> list[AgentMessage]:
+    """Replace ImageBlock instances in older turns with a text placeholder.
+
+    Images consume significant context (base64 data).  Once the model has
+    already seen an image and produced a response, the raw image data is no
+    longer needed.  This function walks through messages and replaces
+    ``ImageBlock`` instances with a lightweight ``TextBlock`` placeholder,
+    *except* for images in the last ``keep_last_turns`` user+assistant turn
+    pairs (counted from the end of the conversation).
+
+    The replacement is done on a shallow copy — the original list is not
+    modified.
+    """
+    if keep_last_turns < 0:
+        keep_last_turns = 0
+
+    # Identify the protected tail: last N turn-pairs (user + assistant).
+    # We count assistant messages from the end and protect everything from
+    # the Nth-from-last assistant onward.
+    protected_start = len(messages)
+    if keep_last_turns > 0:
+        remaining = keep_last_turns
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].role in ("assistant", "user"):
+                remaining -= 1
+                if remaining <= 0:
+                    protected_start = i
+                    break
+
+    result: list[AgentMessage] | None = None
+
+    for i in range(0, min(protected_start, len(messages))):
+        msg = messages[i]
+        if not any(isinstance(b, ImageBlock) for b in msg.content):
+            continue
+
+        new_blocks: list = []
+        changed = False
+        for block in msg.content:
+            if isinstance(block, ImageBlock):
+                new_blocks.append(TextBlock(text=IMAGE_PRUNED_PLACEHOLDER))
+                changed = True
+            else:
+                new_blocks.append(block)
+
+        if changed:
+            if result is None:
+                result = list(messages)
+            result[i] = msg.model_copy(update={"content": new_blocks})
+
+    return result if result is not None else messages
+
+
 def _find_first_user_index(messages: list[AgentMessage]) -> int | None:
     """Return the index of the first user message, or None if there are no user messages."""
     for i, msg in enumerate(messages):
@@ -135,6 +196,7 @@ def prune_messages(
     state: PruningState,
     *,
     context_window_tokens: int = 0,
+    prunable_tools: set[str] | None = None,
 ) -> list[AgentMessage]:
     """Prune old tool results from messages (in-memory only).
 
@@ -158,6 +220,11 @@ def prune_messages(
         uses ratio-based thresholds (softTrimRatio / hardClearRatio) against
         ``context_window_tokens * CHARS_PER_TOKEN_ESTIMATE``.  Falls back to
         the legacy absolute-char mode when 0.
+    prunable_tools:
+        If provided, only prune tool results whose originating tool name is in
+        this set.  Requires resolving ``tool_use_id`` → tool name via
+        ``ToolUseBlock`` in assistant messages.  If ``None``, all tool results
+        are eligible for pruning (current default behavior).
     """
     if config.mode != "cache-ttl":
         return messages
@@ -193,6 +260,16 @@ def prune_messages(
     if cutoff_index is None:
         return messages  # not enough assistant messages to establish protected tail
 
+    # Build tool_use_id → tool_name map when prunable_tools filtering is active.
+    _tool_id_to_name: dict[str, str] | None = None
+    if prunable_tools is not None:
+        _tool_id_to_name = {}
+        for msg in messages:
+            if msg.role == "assistant":
+                for block in msg.content:
+                    if isinstance(block, ToolUseBlock):
+                        _tool_id_to_name[block.id] = block.name
+
     # Collect prunable tool result indices.
     prunable_indices: list[int] = []
 
@@ -207,6 +284,16 @@ def prune_messages(
         has_tool_results = any(isinstance(b, ToolResultBlock) for b in msg.content)
         if not has_tool_results:
             continue
+
+        # If prunable_tools is set, skip messages where none of the tool
+        # results belong to the allowed set.
+        if _tool_id_to_name is not None and prunable_tools is not None:
+            if not any(
+                isinstance(b, ToolResultBlock)
+                and _tool_id_to_name.get(b.tool_use_id, "") in prunable_tools
+                for b in msg.content
+            ):
+                continue
 
         prunable_indices.append(i)
 

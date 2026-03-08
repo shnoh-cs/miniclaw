@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from openclaw.agent.types import ToolDefinition, ToolResult
+from openclaw.agent.types import ToolDefinition, ToolResult, ToolResultBlock
 
 # Type alias for tool execution functions
 ToolExecutor = Callable[[dict[str, Any]], Awaitable[ToolResult]]
@@ -576,3 +576,53 @@ class ToolLoopDetector:
 def _canonical_pair_key(sig_a: str, sig_b: str) -> str:
     """Stable key for a pair of signatures regardless of order."""
     return "|".join(sorted([sig_a, sig_b]))
+
+
+# ---------------------------------------------------------------------------
+# Session tool result guard: cap before writing to session JSONL
+# ---------------------------------------------------------------------------
+
+SESSION_HARD_CAP = 400_000
+
+SESSION_CAP_NOTICE = (
+    "\n\n[Tool result capped before session write — original exceeded "
+    "session storage limit. Re-run with smaller scope if needed.]"
+)
+
+MISSING_TOOL_RESULT_PLACEHOLDER = (
+    "[Tool result not received — possibly timed out]"
+)
+
+
+def cap_tool_result_for_session(content: str, max_chars: int = SESSION_HARD_CAP) -> str:
+    """Hard cap tool result content before writing to session JSONL.
+
+    This is a final safety net that prevents oversized tool output from
+    bloating the on-disk session file.  Unlike ``truncate_tool_result``
+    (which is context-aware and uses head+tail), this is a simple hard
+    chop applied *after* all other guards.
+    """
+    if len(content) <= max_chars:
+        return content
+
+    budget = max(0, max_chars - len(SESSION_CAP_NOTICE))
+    if budget <= 0:
+        return SESSION_CAP_NOTICE.lstrip("\n")
+
+    # Try to cut on a newline boundary within the last 20% of the budget.
+    cut = _find_newline_cut(content, budget)
+    return content[:cut] + SESSION_CAP_NOTICE
+
+
+def synthesize_missing_tool_result(tool_use_id: str) -> ToolResultBlock:
+    """Create a synthetic result for an orphaned tool_use block.
+
+    When the model emits a tool_use block but no corresponding tool result
+    is received (e.g. execution timed out or was interrupted), we inject
+    this placeholder so the message history remains structurally valid.
+    """
+    return ToolResultBlock(
+        tool_use_id=tool_use_id,
+        content=MISSING_TOOL_RESULT_PLACEHOLDER,
+        is_error=True,
+    )

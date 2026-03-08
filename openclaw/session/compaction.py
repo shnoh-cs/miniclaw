@@ -27,6 +27,25 @@ log = logging.getLogger("openclaw.compaction")
 BASE_CHUNK_RATIO = 0.4
 MIN_CHUNK_RATIO = 0.15
 OVERHEAD_TOKENS = 4096
+SAFETY_MARGIN = 1.2  # 20% buffer for estimate_tokens() inaccuracy
+DEFAULT_PARTS = 3
+DEFAULT_SUMMARY_FALLBACK = "No prior history."
+
+# Merge prompt for combining partial summaries into a single cohesive summary
+MERGE_SUMMARIES_INSTRUCTIONS = "\n".join([
+    "Merge these partial summaries into a single cohesive summary.",
+    "",
+    "MUST PRESERVE:",
+    "- Active tasks and their current status (in-progress, blocked, pending)",
+    "- Batch operation progress (e.g., '5/17 items completed')",
+    "- The last thing the user requested and what was being done about it",
+    "- Decisions made and their rationale",
+    "- TODOs, open questions, and constraints",
+    "- Any commitments or follow-ups promised",
+    "",
+    "PRIORITIZE recent context over older history. The agent needs to know",
+    "what it was doing, not just what was discussed.",
+])
 
 # Limits aligned with the original safeguard implementation
 MAX_EXTRACTED_IDENTIFIERS = 12
@@ -509,23 +528,29 @@ async def compact_session(
     # Collect tool failures
     tool_failures = collect_tool_failures(summarize_msgs)
 
-    # Multi-stage chunking if context is too large
-    chunks = _chunk_messages(stripped, context_max_tokens)
+    # Compute adaptive chunk ratio based on average message size
+    chunk_ratio = compute_adaptive_chunk_ratio(stripped, context_max_tokens)
+
     previous_summary = session.latest_compaction_summary
+    total_tokens = _estimate_messages_tokens(stripped)
+    chunk_budget = int(context_max_tokens * chunk_ratio) - OVERHEAD_TOKENS
 
-    summary = ""
-    for chunk in chunks:
-        chunk_text = _messages_to_text(chunk)
-        prompt = _build_summarization_prompt(
-            chunk_text, config.identifier_policy, identifiers, previous_summary
+    # Use multi-stage summarization when messages are large enough
+    if total_tokens > chunk_budget * 2:
+        summary = await summarize_in_stages(
+            stripped, provider, context_max_tokens,
+            config.identifier_policy, identifiers,
+            previous_summary=previous_summary,
+            parts=DEFAULT_PARTS,
+            chunk_ratio=chunk_ratio,
         )
-
-        summary = await _llm_complete_with_retry(
-            provider,
-            system="You are a precise summarizer. Follow the structure exactly.",
-            messages=[AgentMessage(role="user", content=[TextBlock(text=prompt)])],
+    else:
+        summary = await summarize_with_fallback(
+            stripped, provider, context_max_tokens,
+            config.identifier_policy, identifiers,
+            previous_summary=previous_summary,
+            chunk_ratio=chunk_ratio,
         )
-        previous_summary = summary
 
     if not summary:
         return None
@@ -610,6 +635,318 @@ def _chunk_messages(
         chunks.append(current_chunk)
 
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Multi-stage compaction merge helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_parts(parts: int, message_count: int) -> int:
+    """Normalize the number of parts, clamping to [1, message_count]."""
+    if parts <= 1:
+        return 1
+    return min(max(1, parts), max(1, message_count))
+
+
+def _estimate_messages_tokens(messages: list[AgentMessage]) -> int:
+    """Estimate total tokens across a list of messages (with safety margin)."""
+    total = 0
+    for msg in messages:
+        total += _estimate_tokens(msg.text)
+        for tu in msg.tool_uses:
+            total += _estimate_tokens(json.dumps(tu.input))
+        for tr in msg.tool_results:
+            total += _estimate_tokens(tr.content)
+    return total
+
+
+def split_messages_by_token_share(
+    messages: list[AgentMessage],
+    parts: int = DEFAULT_PARTS,
+) -> list[list[AgentMessage]]:
+    """Split messages into N parts where each part has roughly equal token share.
+
+    Uses the estimate_tokens heuristic (len/4). Messages are kept in order;
+    splits happen at message boundaries closest to the ideal per-part token count.
+    """
+    if not messages:
+        return []
+    normalized_parts = _normalize_parts(parts, len(messages))
+    if normalized_parts <= 1:
+        return [messages]
+
+    total_tokens = _estimate_messages_tokens(messages)
+    target_tokens = total_tokens / normalized_parts
+    chunks: list[list[AgentMessage]] = []
+    current: list[AgentMessage] = []
+    current_tokens = 0
+
+    for msg in messages:
+        msg_tokens = _estimate_tokens(msg.text)
+        for tu in msg.tool_uses:
+            msg_tokens += _estimate_tokens(json.dumps(tu.input))
+        for tr in msg.tool_results:
+            msg_tokens += _estimate_tokens(tr.content)
+
+        if (
+            len(chunks) < normalized_parts - 1
+            and current
+            and current_tokens + msg_tokens > target_tokens
+        ):
+            chunks.append(current)
+            current = []
+            current_tokens = 0
+
+        current.append(msg)
+        current_tokens += msg_tokens
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def compute_adaptive_chunk_ratio(
+    messages: list[AgentMessage],
+    context_window: int,
+) -> float:
+    """Compute adaptive chunk ratio based on average message size.
+
+    When messages are large (avg > 10% of context), reduce the chunk ratio
+    to avoid exceeding model limits. Applies SAFETY_MARGIN to account for
+    estimation inaccuracy.
+    """
+    if not messages:
+        return BASE_CHUNK_RATIO
+
+    total_tokens = _estimate_messages_tokens(messages)
+    avg_tokens = total_tokens / len(messages)
+
+    # Apply safety margin to account for estimation inaccuracy
+    safe_avg_tokens = avg_tokens * SAFETY_MARGIN
+    avg_ratio = safe_avg_tokens / context_window
+
+    # If average message is > 10% of context, reduce chunk ratio
+    if avg_ratio > 0.1:
+        reduction = min(avg_ratio * 2, BASE_CHUNK_RATIO - MIN_CHUNK_RATIO)
+        return max(MIN_CHUNK_RATIO, BASE_CHUNK_RATIO - reduction)
+
+    return BASE_CHUNK_RATIO
+
+
+def is_oversized_for_summary(msg: AgentMessage, context_window: int) -> bool:
+    """Check if a single message is too large to summarize.
+
+    A message exceeding 50% of the context window (with safety margin)
+    cannot be summarized safely.
+    """
+    msg_tokens = _estimate_tokens(msg.text)
+    for tu in msg.tool_uses:
+        msg_tokens += _estimate_tokens(json.dumps(tu.input))
+    for tr in msg.tool_results:
+        msg_tokens += _estimate_tokens(tr.content)
+    return (msg_tokens * SAFETY_MARGIN) > context_window * 0.5
+
+
+async def summarize_with_fallback(
+    messages: list[AgentMessage],
+    provider: ModelProvider,
+    context_max_tokens: int,
+    identifier_policy: str,
+    identifiers: list[str],
+    previous_summary: str | None = None,
+    chunk_ratio: float = BASE_CHUNK_RATIO,
+) -> str:
+    """Summarize with progressive fallback for oversized messages.
+
+    1. Try full summarization first.
+    2. On failure, filter out messages > 50% of context window, summarize
+       remaining, and append "[Large message (~NNK tokens) omitted]" notes.
+    3. Final fallback: text-only note about message count.
+    """
+    if not messages:
+        return previous_summary or DEFAULT_SUMMARY_FALLBACK
+
+    chunk_budget = int(context_max_tokens * chunk_ratio) - OVERHEAD_TOKENS
+    if chunk_budget < 2000:
+        chunk_budget = 2000
+
+    # Try full summarization first
+    try:
+        return await _summarize_chunks(
+            messages, provider, chunk_budget, identifier_policy, identifiers, previous_summary
+        )
+    except Exception as full_error:
+        log.warning(
+            "Full summarization failed, trying partial: %s", full_error,
+        )
+
+    # Fallback 1: summarize only small messages, note oversized ones
+    small_messages: list[AgentMessage] = []
+    oversized_notes: list[str] = []
+
+    for msg in messages:
+        if is_oversized_for_summary(msg, context_max_tokens):
+            tokens = _estimate_tokens(msg.text)
+            oversized_notes.append(
+                f"[Large {msg.role} (~{round(tokens / 1000)}K tokens) omitted from summary]"
+            )
+        else:
+            small_messages.append(msg)
+
+    if small_messages:
+        try:
+            partial_summary = await _summarize_chunks(
+                small_messages, provider, chunk_budget,
+                identifier_policy, identifiers, previous_summary,
+            )
+            notes = f"\n\n{chr(10).join(oversized_notes)}" if oversized_notes else ""
+            return partial_summary + notes
+        except Exception as partial_error:
+            log.warning(
+                "Partial summarization also failed: %s", partial_error,
+            )
+
+    # Final fallback: just note what was there
+    return (
+        f"Context contained {len(messages)} messages "
+        f"({len(oversized_notes)} oversized). "
+        f"Summary unavailable due to size limits."
+    )
+
+
+async def _summarize_chunks(
+    messages: list[AgentMessage],
+    provider: ModelProvider,
+    chunk_budget: int,
+    identifier_policy: str,
+    identifiers: list[str],
+    previous_summary: str | None = None,
+) -> str:
+    """Sequential chunk summarization — each chunk summary feeds into the next."""
+    if not messages:
+        return previous_summary or DEFAULT_SUMMARY_FALLBACK
+
+    # Apply safety margin to chunk budget
+    effective_budget = max(1, int(chunk_budget / SAFETY_MARGIN))
+
+    chunks: list[list[AgentMessage]] = []
+    current_chunk: list[AgentMessage] = []
+    current_tokens = 0
+
+    for msg in messages:
+        msg_tokens = _estimate_tokens(msg.text)
+        for tu in msg.tool_uses:
+            msg_tokens += _estimate_tokens(json.dumps(tu.input))
+        for tr in msg.tool_results:
+            msg_tokens += _estimate_tokens(tr.content)
+
+        if current_chunk and current_tokens + msg_tokens > effective_budget:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_tokens = 0
+
+        current_chunk.append(msg)
+        current_tokens += msg_tokens
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    summary = previous_summary
+    for chunk in chunks:
+        chunk_text = _messages_to_text(chunk)
+        prompt = _build_summarization_prompt(
+            chunk_text, identifier_policy, identifiers, summary,
+        )
+        summary = await _llm_complete_with_retry(
+            provider,
+            system="You are a precise summarizer. Follow the structure exactly.",
+            messages=[AgentMessage(role="user", content=[TextBlock(text=prompt)])],
+        )
+
+    return summary or DEFAULT_SUMMARY_FALLBACK
+
+
+async def summarize_in_stages(
+    messages: list[AgentMessage],
+    provider: ModelProvider,
+    context_max_tokens: int,
+    identifier_policy: str,
+    identifiers: list[str],
+    previous_summary: str | None = None,
+    parts: int = DEFAULT_PARTS,
+    min_messages_for_split: int = 4,
+    chunk_ratio: float = BASE_CHUNK_RATIO,
+) -> str:
+    """Multi-stage compaction: split large message sets, summarize each independently,
+    then merge partial summaries using dedicated merge instructions.
+
+    When messages are too large for a single summarization pass
+    (total tokens > chunk_budget * 2), split into N parts, summarize each
+    independently, then merge the partial summaries.
+
+    Falls back to summarize_with_fallback for small inputs.
+    """
+    if not messages:
+        return previous_summary or DEFAULT_SUMMARY_FALLBACK
+
+    min_messages_for_split = max(2, min_messages_for_split)
+    normalized_parts = _normalize_parts(parts, len(messages))
+    total_tokens = _estimate_messages_tokens(messages)
+
+    chunk_budget = int(context_max_tokens * chunk_ratio) - OVERHEAD_TOKENS
+    if chunk_budget < 2000:
+        chunk_budget = 2000
+
+    # For small inputs, use direct summarization with fallback
+    if (
+        normalized_parts <= 1
+        or len(messages) < min_messages_for_split
+        or total_tokens <= chunk_budget
+    ):
+        return await summarize_with_fallback(
+            messages, provider, context_max_tokens,
+            identifier_policy, identifiers, previous_summary, chunk_ratio,
+        )
+
+    # Split into roughly equal token-share parts
+    splits = [
+        chunk for chunk in split_messages_by_token_share(messages, normalized_parts)
+        if chunk
+    ]
+    if len(splits) <= 1:
+        return await summarize_with_fallback(
+            messages, provider, context_max_tokens,
+            identifier_policy, identifiers, previous_summary, chunk_ratio,
+        )
+
+    # Summarize each part independently (no previous summary chaining)
+    partial_summaries: list[str] = []
+    for chunk in splits:
+        partial = await summarize_with_fallback(
+            chunk, provider, context_max_tokens,
+            identifier_policy, identifiers,
+            previous_summary=None, chunk_ratio=chunk_ratio,
+        )
+        partial_summaries.append(partial)
+
+    if len(partial_summaries) == 1:
+        return partial_summaries[0]
+
+    # Merge partial summaries using dedicated merge instructions
+    merge_prompt = (
+        f"{MERGE_SUMMARIES_INSTRUCTIONS}\n\n"
+        "Partial summaries to merge:\n\n"
+        + "\n\n---\n\n".join(partial_summaries)
+    )
+
+    merged = await _llm_complete_with_retry(
+        provider,
+        system="You are a precise summarizer. Follow the structure exactly.",
+        messages=[AgentMessage(role="user", content=[TextBlock(text=merge_prompt)])],
+    )
+
+    return merged or DEFAULT_SUMMARY_FALLBACK
 
 
 async def _safeguard_validate(

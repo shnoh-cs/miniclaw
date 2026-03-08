@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
@@ -416,6 +417,85 @@ def build_fts_query(raw: str) -> str | None:
     return " AND ".join(quoted)
 
 
+class FileWatcher:
+    """Track file modification times for delta-based reindexing.
+
+    Call ``check_and_reindex()`` to detect changed files and re-index only
+    those that have been modified since the last check.  Debounced so it
+    runs at most once every ``debounce_seconds`` (default 30 s).
+    """
+
+    def __init__(self, debounce_seconds: float = 30.0) -> None:
+        self._mtimes: dict[str, float] = {}
+        self._debounce_seconds = debounce_seconds
+        self._last_check: float = 0.0
+
+    def register(self, path: Path) -> None:
+        """Register a file path to watch (records its current mtime)."""
+        try:
+            self._mtimes[str(path)] = path.stat().st_mtime
+        except OSError:
+            pass
+
+    def check_changed(self) -> list[Path]:
+        """Return list of registered paths whose mtime has changed.
+
+        Respects the debounce interval — returns an empty list if called
+        too soon after the previous check.
+        """
+        now = time.time()
+        if now - self._last_check < self._debounce_seconds:
+            return []
+        self._last_check = now
+
+        changed: list[Path] = []
+        for path_str, old_mtime in list(self._mtimes.items()):
+            p = Path(path_str)
+            try:
+                current_mtime = p.stat().st_mtime
+            except OSError:
+                # File deleted — mark as changed so caller can handle
+                changed.append(p)
+                continue
+            if current_mtime != old_mtime:
+                self._mtimes[path_str] = current_mtime
+                changed.append(p)
+        return changed
+
+    async def check_and_reindex(self, searcher: MemorySearcher) -> int:
+        """Check for changed files and re-index them.
+
+        Returns total number of new chunks indexed across all changed files.
+        """
+        changed = self.check_changed()
+        total = 0
+        for path in changed:
+            if path.exists():
+                total += await searcher.index_file(path)
+        return total
+
+
+def clamp_results_by_chars(
+    results: list[SearchResult],
+    char_budget: int = 8000,
+) -> list[SearchResult]:
+    """Limit results so total injected text stays within *char_budget*.
+
+    Iterates through results (assumed pre-sorted by relevance) and stops
+    adding once the cumulative character count would exceed the budget.
+    """
+    clamped: list[SearchResult] = []
+    total_chars = 0
+    for r in results:
+        text_len = len(r.chunk.text)
+        if total_chars + text_len > char_budget and clamped:
+            # Already have at least one result; stop here
+            break
+        clamped.append(r)
+        total_chars += text_len
+    return clamped
+
+
 class MemorySearcher:
     """Hybrid search engine combining vector similarity and BM25."""
 
@@ -424,10 +504,12 @@ class MemorySearcher:
         store: MemoryStore,
         embedding_provider: EmbeddingProvider,
         config: MemoryConfig,
+        file_watcher: FileWatcher | None = None,
     ) -> None:
         self.store = store
         self.embedding_provider = embedding_provider
         self.config = config
+        self.file_watcher = file_watcher
 
     async def search(
         self,
@@ -439,37 +521,52 @@ class MemorySearcher:
         if not query or not query.strip():
             return []
 
+        # Auto-reindex changed files (debounced)
+        if self.file_watcher is not None:
+            try:
+                await self.file_watcher.check_and_reindex(self)
+            except Exception:
+                pass  # don't let watcher errors block search
+
         hybrid = self.config.hybrid
         # Use 4x candidate multiplier (matching original OpenClaw)
         candidates = min(200, max(1, max_results * _CANDIDATE_MULTIPLIER))
 
         results_by_id: dict[int, SearchResult] = {}
 
-        # 1. Vector search
+        # 1. Vector search (batch cosine similarity via cached matrix)
         try:
             query_embedding = await self.embedding_provider.embed_single(query)
-            all_embeddings = self.store.get_all_embeddings()
+            cached = self.store.get_all_embeddings_cached()
 
-            if all_embeddings:
-                # Compute cosine similarities
-                scores = []
-                for chunk_id, emb in all_embeddings:
-                    sim = cosine_similarity(query_embedding, emb)
-                    scores.append((chunk_id, sim))
+            if cached is not None:
+                ids, matrix = cached
+                # Batch cosine similarity: dot(query, matrix^T) / (|query| * |rows|)
+                query_norm = np.linalg.norm(query_embedding)
+                if query_norm > 0:
+                    row_norms = np.linalg.norm(matrix, axis=1)
+                    # Avoid division by zero for any row
+                    safe_norms = np.where(row_norms > 0, row_norms, 1.0)
+                    similarities = matrix @ query_embedding / (safe_norms * query_norm)
+                    # Get top-k indices efficiently via argpartition
+                    if len(similarities) > candidates:
+                        top_indices = np.argpartition(similarities, -candidates)[-candidates:]
+                        top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
+                    else:
+                        top_indices = np.argsort(similarities)[::-1]
 
-                scores.sort(key=lambda x: x[1], reverse=True)
-                top_vector = scores[:candidates]
+                    chunk_ids = [ids[i] for i in top_indices]
+                    chunks = self.store.get_chunks_by_ids(chunk_ids)
+                    chunk_map = {c.id: c for c in chunks}
 
-                chunk_ids = [cid for cid, _ in top_vector]
-                chunks = self.store.get_chunks_by_ids(chunk_ids)
-                chunk_map = {c.id: c for c in chunks}
-
-                for chunk_id, sim in top_vector:
-                    if chunk_id in chunk_map:
-                        results_by_id[chunk_id] = SearchResult(
-                            chunk=chunk_map[chunk_id],
-                            vector_score=sim,
-                        )
+                    for idx in top_indices:
+                        cid = ids[idx]
+                        sim = float(similarities[idx])
+                        if cid in chunk_map:
+                            results_by_id[cid] = SearchResult(
+                                chunk=chunk_map[cid],
+                                vector_score=sim,
+                            )
         except Exception:
             pass  # degrade to BM25 only
 
@@ -607,3 +704,114 @@ class MemorySearcher:
             self.store.upsert_chunk(chunk)
 
         return len(chunks)
+
+    async def index_session_jsonl(
+        self,
+        jsonl_path: Path,
+        chunk_size: int = 1600,
+        overlap: int = 320,
+    ) -> int:
+        """Index a JSONL session file into memory with source_type='session'.
+
+        Reads each line as JSON, extracts text content from user/assistant
+        messages, chunks them, and stores with source_type='session'.
+        Returns total number of chunks created.
+        """
+        if not jsonl_path.exists():
+            return 0
+
+        # Extract text from session messages
+        texts: list[str] = []
+        try:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    role = entry.get("role", "")
+                    if role not in ("user", "assistant"):
+                        continue
+                    content = entry.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        texts.append(content.strip())
+                    elif isinstance(content, list):
+                        # Multi-part content blocks
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                t = block.get("text", "")
+                                if t.strip():
+                                    texts.append(t.strip())
+        except OSError:
+            return 0
+
+        if not texts:
+            return 0
+
+        # Delete existing session chunks for this file
+        self.store.delete_by_file(str(jsonl_path))
+
+        # Merge texts and chunk
+        merged = "\n\n".join(texts)
+        lines = merged.splitlines()
+        raw_chunks: list[tuple[int, int, str]] = []
+
+        i = 0
+        while i < len(lines):
+            end = min(i + chunk_size // 50, len(lines))
+            chunk_text = "\n".join(lines[i:end])
+
+            if len(chunk_text) > chunk_size:
+                chunk_text = chunk_text[:chunk_size]
+                last_nl = chunk_text.rfind("\n")
+                if last_nl > chunk_size // 2:
+                    chunk_text = chunk_text[:last_nl]
+                    end = i + chunk_text.count("\n") + 1
+
+            if chunk_text.strip():
+                raw_chunks.append((i + 1, end, chunk_text))
+
+            overlap_lines = max(1, overlap // 50)
+            i = end - overlap_lines if end < len(lines) else len(lines)
+
+        if not raw_chunks:
+            return 0
+
+        # Batch embed
+        chunk_texts = [c[2] for c in raw_chunks]
+        embeddings: list[np.ndarray | None] = [None] * len(chunk_texts)
+        uncached_indices: list[int] = []
+        uncached_texts: list[str] = []
+
+        for idx, t in enumerate(chunk_texts):
+            text_hash = EmbeddingProvider.text_hash(t)
+            cached = self.store.get_cached_embedding(text_hash)
+            if cached is not None:
+                embeddings[idx] = cached
+            else:
+                uncached_indices.append(idx)
+                uncached_texts.append(t)
+
+        if uncached_texts:
+            new_embeddings = await self.embedding_provider.embed(uncached_texts)
+            for idx_i, emb in zip(uncached_indices, new_embeddings):
+                embeddings[idx_i] = emb
+                text_hash = EmbeddingProvider.text_hash(chunk_texts[idx_i])
+                self.store.cache_embedding(text_hash, emb)
+
+        # Store chunks with source_type='session'
+        for (line_start, line_end, chunk_text), emb in zip(raw_chunks, embeddings):
+            chunk = MemoryChunk(
+                file_path=str(jsonl_path),
+                line_start=line_start,
+                line_end=line_end,
+                text=chunk_text,
+                embedding=emb,
+                source_type="session",
+            )
+            self.store.upsert_chunk(chunk)
+
+        return len(raw_chunks)

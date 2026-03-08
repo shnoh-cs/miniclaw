@@ -45,13 +45,25 @@ from openclaw.prompt.sanitize import sanitize_text
 from openclaw.session.compaction import compact_session
 from openclaw.session.manager import SessionManager, SessionWriteLock
 from openclaw.session.memory_flush import execute_memory_flush, should_flush
-from openclaw.session.pruning import PruningState, prune_messages
+from openclaw.session.pruning import PruningState, prune_messages, prune_processed_images
 from openclaw.skills.loader import build_skills_prompt, load_skills
-from openclaw.tools.registry import ToolLoopDetector, ToolRegistry, truncate_tool_result
+from openclaw.tools.registry import (
+    ToolLoopDetector,
+    ToolRegistry,
+    cap_tool_result_for_session,
+    synthesize_missing_tool_result,
+    truncate_tool_result,
+)
 
 # Thinking/final tag patterns
 _THINKING_PATTERN = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL)
 _FINAL_PATTERN = re.compile(r"<final>(.*?)</final>", re.DOTALL)
+
+# Thinking-related error patterns (model rejects the requested thinking level)
+_THINKING_ERROR_PATTERN = re.compile(
+    r"thinking|reasoning|extended.?thinking|budget_tokens|not.?supported.*think",
+    re.IGNORECASE,
+)
 
 # NO_REPLY suppression token
 NO_REPLY = "NO_REPLY"
@@ -191,6 +203,9 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
             ctx.session.messages, ctx.config.pruning, ctx.pruning_state
         )
 
+        # Strip already-processed images from older turns
+        pruned_messages = prune_processed_images(pruned_messages)
+
         # Build system prompt
         system_prompt = build_system_prompt(
             config=ctx.config,
@@ -210,26 +225,41 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
         partial_tool_args: dict[int, dict[str, str]] = {}  # index → {name, args_buffer}
         usage = TokenUsage()
 
-        async for chunk in ctx.provider.stream(
-            system=system_prompt,
-            messages=pruned_messages,
-            tools=ctx.tool_registry.get_definitions(),
-            model=model,
-            thinking=ctx.thinking,
-        ):
-            # Handle text
-            if chunk.text:
-                accumulated_text += chunk.text
-                if ctx.on_stream:
-                    ctx.on_stream(chunk.text)
+        try:
+            async for chunk in ctx.provider.stream(
+                system=system_prompt,
+                messages=pruned_messages,
+                tools=ctx.tool_registry.get_definitions(),
+                model=model,
+                thinking=ctx.thinking,
+            ):
+                # Handle text
+                if chunk.text:
+                    accumulated_text += chunk.text
+                    if ctx.on_stream:
+                        ctx.on_stream(chunk.text)
 
-            # Handle native tool calls (streaming accumulation)
-            if chunk.tool_calls:
-                tool_calls.extend(chunk.tool_calls)
+                # Handle native tool calls (streaming accumulation)
+                if chunk.tool_calls:
+                    tool_calls.extend(chunk.tool_calls)
 
-            # Handle usage (last chunk)
-            if chunk.usage:
-                usage = chunk.usage
+                # Handle usage (last chunk)
+                if chunk.usage:
+                    usage = chunk.usage
+        except Exception as stream_err:
+            # Thinking level fallback: if the model rejects the thinking
+            # level, drop one level and retry the same turn without
+            # counting it as a failover attempt.
+            if (
+                ctx.thinking != ThinkingLevel.OFF
+                and _is_thinking_error(stream_err)
+            ):
+                lower = ctx.thinking.fallback()
+                if lower != ctx.thinking:
+                    ctx.thinking = lower
+                    turn_count -= 1  # don't count this turn
+                    continue
+            raise
 
         # Update pruning state
         ctx.pruning_state.touch()
@@ -302,6 +332,9 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
             max_chars = ctx.context_guard.tool_result_max_chars()
             tool_result.content = truncate_tool_result(tool_result.content, max_chars)
 
+            # Session guard: hard cap before session write
+            tool_result.content = cap_tool_result_for_session(tool_result.content)
+
             # Loop detection
             warning = ctx.loop_detector.record(tc.name, tc.input, tool_result.content)
             if warning:
@@ -354,6 +387,19 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
                 )
             )
 
+        # Synthesize missing results for orphaned tool_use blocks.
+        # If the model emitted a tool_use that we didn't execute (e.g. unknown
+        # tool, or execution was skipped), inject a placeholder so the
+        # conversation stays structurally valid for the next model call.
+        answered_ids = {
+            b.tool_use_id
+            for b in tool_result_blocks
+            if isinstance(b, ToolResultBlock)
+        }
+        for tc in tool_calls:
+            if tc.id not in answered_ids:
+                tool_result_blocks.append(synthesize_missing_tool_result(tc.id))
+
         # Append tool results as user message (OpenAI convention)
         if tool_result_blocks:
             user_result_msg = AgentMessage(role="user", content=tool_result_blocks)
@@ -366,6 +412,15 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
 
     result.messages = ctx.session.messages
     return result
+
+
+def _is_thinking_error(error: Exception) -> bool:
+    """Check if an error indicates the model rejected a thinking level.
+
+    Matches messages containing thinking/reasoning-related keywords that
+    indicate the requested thinking configuration is unsupported.
+    """
+    return bool(_THINKING_ERROR_PATTERN.search(str(error)))
 
 
 def _parse_thinking(text: str) -> tuple[str, str]:

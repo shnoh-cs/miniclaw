@@ -25,6 +25,7 @@ class MemoryChunk:
     score: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    source_type: str = "file"  # "file" | "session"
 
 
 class MemoryStore:
@@ -34,6 +35,9 @@ class MemoryStore:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: sqlite3.Connection | None = None
+        # Cached embedding matrix for fast batch cosine similarity
+        self._emb_cache_ids: list[int] | None = None
+        self._emb_cache_matrix: np.ndarray | None = None
         self._ensure_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
@@ -78,10 +82,22 @@ class MemoryStore:
         except sqlite3.OperationalError:
             pass  # FTS5 not available, keyword search will degrade
 
+        # Migration: add source_type column if not present
+        try:
+            conn.execute("SELECT source_type FROM chunks LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE chunks ADD COLUMN source_type TEXT NOT NULL DEFAULT 'file'")
+
         conn.commit()
+
+    def _invalidate_embedding_cache(self) -> None:
+        """Invalidate the in-memory embedding matrix cache."""
+        self._emb_cache_ids = None
+        self._emb_cache_matrix = None
 
     def upsert_chunk(self, chunk: MemoryChunk) -> int:
         """Insert or update a chunk. Returns the chunk ID."""
+        self._invalidate_embedding_cache()
         conn = self._get_conn()
         embedding_blob = chunk.embedding.tobytes() if chunk.embedding is not None else None
 
@@ -99,11 +115,12 @@ class MemoryStore:
             conn.commit()
             return chunk.id
 
+        source_type = getattr(chunk, "source_type", "file")
         cursor = conn.execute(
-            "INSERT INTO chunks (file_path, line_start, line_end, text, embedding, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks (file_path, line_start, line_end, text, embedding, created_at, updated_at, source_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (chunk.file_path, chunk.line_start, chunk.line_end, chunk.text,
-             embedding_blob, chunk.created_at, chunk.updated_at),
+             embedding_blob, chunk.created_at, chunk.updated_at, source_type),
         )
         chunk_id = cursor.lastrowid
 
@@ -144,7 +161,7 @@ class MemoryStore:
         conn = self._get_conn()
         placeholders = ",".join("?" for _ in ids)
         rows = conn.execute(
-            f"SELECT id, file_path, line_start, line_end, text, created_at, updated_at "
+            f"SELECT id, file_path, line_start, line_end, text, created_at, updated_at, source_type "
             f"FROM chunks WHERE id IN ({placeholders})",
             ids,
         ).fetchall()
@@ -153,6 +170,7 @@ class MemoryStore:
             MemoryChunk(
                 id=r[0], file_path=r[1], line_start=r[2], line_end=r[3],
                 text=r[4], created_at=r[5], updated_at=r[6],
+                source_type=r[7] if len(r) > 7 else "file",
             )
             for r in rows
         ]
@@ -170,8 +188,29 @@ class MemoryStore:
         except sqlite3.OperationalError:
             return []  # FTS5 not available
 
+    def get_all_embeddings_cached(self) -> tuple[list[int], np.ndarray] | None:
+        """Return a pre-built (ids, matrix) pair for fast batch cosine similarity.
+
+        The result is cached in memory and invalidated on insert/update/delete.
+        Returns None if no embeddings exist.
+        """
+        if self._emb_cache_ids is not None and self._emb_cache_matrix is not None:
+            return (self._emb_cache_ids, self._emb_cache_matrix)
+
+        all_embs = self.get_all_embeddings()
+        if not all_embs:
+            return None
+
+        ids = [cid for cid, _ in all_embs]
+        matrix = np.vstack([emb for _, emb in all_embs])
+        # Pre-compute norms for the matrix (stored alongside for caller use)
+        self._emb_cache_ids = ids
+        self._emb_cache_matrix = matrix
+        return (ids, matrix)
+
     def delete_by_file(self, file_path: str) -> int:
         """Delete all chunks for a file. Returns count deleted."""
+        self._invalidate_embedding_cache()
         conn = self._get_conn()
         cursor = conn.execute("DELETE FROM chunks WHERE file_path=?", (file_path,))
         conn.commit()
