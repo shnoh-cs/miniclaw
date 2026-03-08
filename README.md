@@ -416,6 +416,356 @@ Written 2 messages → Loaded 2 messages
 
 ---
 
+## gpt-oss-120b 테스트 결과
+
+> 테스트 환경: macOS Darwin 24.5.0 (Apple Silicon), Python 3.11.12
+> 모델: `openai/gpt-oss-120b` (117B MoE, OpenAI 오픈웨이트) via OpenRouter
+> 날짜: 2026-03-08
+
+### Test 1: 단순 질문 (도구 미사용)
+
+**입력:** `What is 2+2? Answer in one word only.`
+**출력:**
+```
+Text: Four
+Tool calls: 0
+Error: None
+Time: 1.6s
+Usage: in=2262, out=3
+```
+- **PASS** — 도구 없이 즉답, 1.6초
+
+### Test 2: 단일 파일 읽기 (Read 도구)
+
+**입력:** `Read pyproject.toml and tell me the project name and version.`
+**출력:**
+```
+Text: **Project Name:** `openclaw-py`
+      **Version:** `0.1.0`
+Tool calls: 1
+Error: None
+Time: 4.2s
+```
+- **PASS** — Read 도구로 파일 읽고 정확히 추출
+
+### Test 3: Bash 명령 실행
+
+**입력:** `Run the command "echo hello world" and tell me its output.`
+**출력:**
+```
+Text: The command printed:
+      hello world
+Tool calls: 1
+Error: None
+Time: 2.8s
+```
+- **PASS** — Bash 도구 실행 정상
+
+### Test 4: 파일 쓰기 + 읽기 검증
+
+**입력:** `Write a file /tmp/oss-test.txt with "gpt-oss-120b test successful" then read it back.`
+**출력:**
+```
+Text: The file was created and contains the expected text:
+      gpt-oss-120b test successful
+Tool calls: 2
+Error: None
+Time: 4.1s
+```
+- **PASS** — Write → Read 라운드트립 정상
+
+### Test 5: 다중 파일 읽기 + 분석
+
+**입력:** `Read pyproject.toml and config.example.toml. List the dependencies.`
+**출력:**
+```
+Text: **Dependencies listed in `pyproject.toml`**
+      - openai>=1.30.0
+      - tiktoken>=0.7.0
+      - numpy>=1.26.0
+      - pydantic>=2.7.0
+      - httpx>=0.27.0
+      - rich>=13.7.0
+      - beautifulsoup4>=4.12.0
+      - PyPDF2>=3.0.0
+      - PyYAML>=6.0.0
+Tool calls: 2
+Error: None
+Time: 4.3s
+```
+- **PASS** — 2개 파일 순차 읽기 + 의존성 정확히 나열
+
+### Test 6: 파일 편집 (Edit)
+
+**입력:** `Write "name = old_value", edit to "new_value", read to confirm.`
+**출력:**
+```
+Text: The file has been successfully created, edited, and verified.
+      Contents: name = new_value
+Tool calls: 3
+Error: None
+Time: 4.7s
+```
+- **PASS** — Write → Edit → Read 3단계 정상
+
+### Test 7: 연쇄 추론 (4단계 도구 체이닝)
+
+**입력:** `Run date, write log file with the date, read it back.`
+**출력:**
+```
+Text: Here is the content of /tmp/oss-log.txt:
+      Log entry: 2026-03-08 12:26:10 KST
+Tool calls: 4
+Error: None
+Time: 7.8s
+```
+- **PASS** — Bash(date) → Write → Read까지 4회 도구 연쇄, 날짜 정확히 포함
+
+### Test 8: 웹 페치
+
+**입력:** `Fetch https://httpbin.org/json and tell me what data it contains.`
+**출력:**
+```
+Text: {
+        "slideshow": {
+          "author": "Yours Truly",
+          "title": "Sample Slide Show",
+          "slides": [...]
+        }
+      }
+Tool calls: 1
+Error: None
+Time: 7.3s
+```
+- **PASS** — WebFetch 도구로 JSON 데이터 정확히 파싱
+
+### Test 9: 코드 분석
+
+**입력:** `Read loop.py, tell me MAX_TURNS_PER_RUN and list the main functions.`
+**출력:**
+```
+Text: MAX_TURNS_PER_RUN = 50
+      Main functions: run(), _attempt_loop(), _parse_thinking(), stream_run()
+Tool calls: 2
+Error: None
+Time: 8.1s
+```
+- **PASS** — 상수값 정확, 함수 목록 정확
+
+### Test 10: 에러 처리 (존재하지 않는 파일)
+
+**입력:** `Read /tmp/this-does-not-exist-99999.txt`
+**출력:**
+```
+Text: The file /tmp/this-does-not-exist-99999.txt does not exist,
+      so there's nothing to read.
+Tool calls: 1
+Error: None
+Time: 3.2s
+```
+- **PASS** — 도구 에러를 해석하여 사용자 친화적 응답
+
+### Test 11: 스트리밍 API
+
+**코드:** `async for chunk in agent.stream("Count from 1 to 5")`
+**출력:**
+```
+Chunks: 9
+Text: 1
+      2
+      3
+      4
+      5
+Time: 1.8s
+```
+- **PASS** — 스트리밍 청크 9개 수신, 내용 정확
+
+### Test 12: 커스텀 도구 (@agent.tool)
+
+**입력:** `What is the weather in Seoul?` (커스텀 get_weather 도구 등록)
+**출력:**
+```
+Text: The current weather in Seoul is sunny with a temperature around 22 °C.
+Tool calls: 1
+Error: None
+Time: 5.4s
+Usage: in=2503, out=93
+```
+- **PASS** — @agent.tool 데코레이터 커스텀 도구 호출 정상
+
+### Test 13: 다중 턴 대화 (세션 지속성)
+
+**턴 1 입력:** `My name is Alice and I work on Project Falcon.`
+**턴 1 출력:**
+```
+Text: Got it! I've noted that your name is Alice and you're working on
+      Project Falcon. Let me know how I can help.
+Tool calls: 1
+Time: 4.5s
+```
+**턴 2 입력:** `What is my name and what project am I working on?`
+**턴 2 출력:**
+```
+Text: Your name is Alice, and you're working on Project Falcon.
+Tool calls: 1
+Time: 4.6s
+```
+- **PASS** — 세션 내 컨텍스트 정확히 유지
+
+### Test 14: 파일 편집 (Apply Patch / Edit)
+
+**입력:** `Edit /tmp/oss-patch.py to change print("hello") to print("hello world"), read to confirm.`
+**출력:**
+```
+Text: Updated /tmp/oss-patch.py content:
+      def greet():
+          print("hello world")
+Tool calls: 2
+Error: None
+Time: 3.5s
+```
+- **PASS** — Edit 도구로 정확히 수정 후 확인
+
+### Test 15: 컨텍스트 가드 (토큰 예산 관리)
+
+```
+1000 tokens:  OK      (util=0.04)
+threshold:    COMPACT (util=0.84)
+overflow:     ERROR   (util=1.24)
+Tool result max chars: 39321
+```
+- **PASS**
+
+### Test 16: 도구 루프 감지
+
+```
+Call 1: ok
+Call 2: ok
+Call 3: ok
+Call 4: WARNING - Tool 'Read' polling with no progress (4 identical results).
+Call 5: WARNING
+Call 6: WARNING
+```
+- **PASS** — 4회차부터 경고 발생
+
+### Test 17: 도구 결과 트렁케이션
+
+```
+Small (5 chars):              truncated=False
+Large (50000 chars, max=10000): len=10053, has_notice=True
+```
+- **PASS**
+
+### Test 18: 프롬프트 인젝션 방어
+
+```
+Control chars: "HelloWorld" (제거됨)
+HTML escaped: <script> → &lt;script&gt;
+Untrusted wrapping: <untrusted-text> 태그 적용
+```
+- **PASS**
+
+### Test 19: Thinking 레벨 폴백 체인
+
+```
+off->off | minimal->off | low->minimal | medium->low | high->medium | xhigh->high | adaptive->off
+from_str("invalid"): off
+```
+- **PASS**
+
+### Test 20: 에러 분류 (페일오버)
+
+```
+"Rate limit exceeded"                 → rate_limit       [PASS]
+"Request timed out"                   → timeout          [PASS]
+"maximum context length exceeded"     → context_overflow  [PASS]
+```
+- **PASS**
+
+### Test 21: 부트스트랩 파일 로딩
+
+```
+Files: [], has_soul=False
+```
+- **PASS** — 파일 부재 시 빈 컨텍스트 반환
+
+### Test 22: 세션 JSONL 영속성
+
+```
+Written: 2 → Loaded: 2
+  [user] Hello
+  [assistant] Hi!
+```
+- **PASS**
+
+### Test 23: 프롬프트 기반 도구 호출 파싱
+
+```
+Single <tool_call>:  1 call, name=Read
+Multi <tool_call>:   2 calls, names=[Bash, Read]
+No closing tag:      1 call (streaming cutoff 처리)
+```
+- **PASS**
+
+### Test 24: 스트리밍 콜백 시스템
+
+**입력:** `Run echo test123 and tell me the output.`
+**출력:**
+```
+Stream chunks: 10
+Tool events: [('start', 'bash'), ('end', 'bash', True)]
+Text: The command printed: test123
+Time: 2.5s
+```
+- **PASS** — on_stream, on_tool_start, on_tool_end 콜백 모두 정상
+
+### gpt-oss-120b 테스트 요약
+
+| # | 테스트 | 도구 호출 | 시간 | 결과 |
+|---|--------|----------|------|------|
+| 1 | 단순 질문 | 0 | 1.6s | PASS |
+| 2 | 파일 읽기 | 1 | 4.2s | PASS |
+| 3 | Bash 명령 | 1 | 2.8s | PASS |
+| 4 | 쓰기+읽기 | 2 | 4.1s | PASS |
+| 5 | 다중 파일 분석 | 2 | 4.3s | PASS |
+| 6 | 파일 편집 | 3 | 4.7s | PASS |
+| 7 | 연쇄 추론 (4단계) | 4 | 7.8s | PASS |
+| 8 | 웹 페치 | 1 | 7.3s | PASS |
+| 9 | 코드 분석 | 2 | 8.1s | PASS |
+| 10 | 에러 처리 | 1 | 3.2s | PASS |
+| 11 | 스트리밍 API | - | 1.8s | PASS |
+| 12 | 커스텀 도구 | 1 | 5.4s | PASS |
+| 13 | 다중 턴 세션 | 2 | 9.1s | PASS |
+| 14 | 파일 편집 (패치) | 2 | 3.5s | PASS |
+| 15 | 컨텍스트 가드 | - | - | PASS |
+| 16 | 루프 감지 | - | - | PASS |
+| 17 | 결과 트렁케이션 | - | - | PASS |
+| 18 | 인젝션 방어 | - | - | PASS |
+| 19 | Thinking 폴백 | - | - | PASS |
+| 20 | 에러 분류 | - | - | PASS |
+| 21 | 부트스트랩 로딩 | - | - | PASS |
+| 22 | 세션 영속성 | - | - | PASS |
+| 23 | 프롬프트 파싱 | - | - | PASS |
+| 24 | 스트리밍 콜백 | 1 | 2.5s | PASS |
+| | **합계** | | | **24/24** |
+
+### 모델 비교: Claude Sonnet 4.6 vs gpt-oss-120b
+
+| 항목 | Claude Sonnet 4.6 | gpt-oss-120b |
+|------|-------------------|--------------|
+| 전체 통과율 | 24/24 (100%) | 24/24 (100%) |
+| 네이티브 tool calling | 지원 | 지원 |
+| 응답 품질 | 매우 상세 (마크다운 테이블, 이모지) | 간결하고 정확 |
+| 평균 응답 시간 (도구 1회) | ~3-5s | ~3-5s |
+| 연쇄 추론 (3-4단계) | 정상 | 정상 |
+| 다중 턴 기억 | 정상 | 정상 |
+| 에러 해석 능력 | 상세한 제안 포함 | 간단하고 명확 |
+| 코드 분석 | 상세 설명 | 핵심 정확히 추출 |
+
+**결론:** `gpt-oss-120b`는 117B MoE 오픈웨이트 모델임에도 모든 에이전트 기능(네이티브 tool calling, 연쇄 추론, 다중 턴, 에러 처리)을 완벽히 수행. 사내 vLLM 환경에서도 문제없이 동작할 것으로 예상.
+
+---
+
 ## 개발 중 발견 & 수정된 버그
 
 ### Bug 1: 스트리밍 도구 호출 중복 (duplicate tool_use ID)
