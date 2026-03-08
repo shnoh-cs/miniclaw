@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from openclaw.agent.loop import AgentContext, run, stream_run
-from openclaw.agent.types import ThinkingLevel, ToolDefinition, ToolResult
+from openclaw.agent.types import ThinkingLevel, ToolDefinition, ToolParameter, ToolResult
 from openclaw.config import AppConfig, load_config
 from openclaw.context.guard import ContextGuard
 from openclaw.memory.embeddings import EmbeddingProvider
@@ -47,7 +47,7 @@ def _register_builtins(registry: ToolRegistry, workspace: str) -> None:
         (web_fetch, "web"),
         (pdf_tool, "analysis"),
         (hancom_tool, "analysis"),
-        (image_tool, "analysis"),
+        # image_tool is registered separately in Agent.__init__ (needs provider)
     ]
 
     for mod, group in modules:
@@ -63,6 +63,9 @@ def _register_builtins(registry: ToolRegistry, workspace: str) -> None:
             _make_tool_executor(mod, workspace),
             group=group,
         )
+
+    # Image tool (stub — wired up with real provider in Agent class)
+    registry.register(image_tool.DEFINITION, _make_tool_executor(image_tool, workspace), group="analysis")
 
     # Memory tools (stubs — wired up with real searcher in Agent class)
     registry.register(memory_tool.SEARCH_DEFINITION, memory_tool.execute_search, group="memory")
@@ -88,6 +91,12 @@ class Agent:
         # Tool registry
         self.tool_registry = ToolRegistry()
         _register_builtins(self.tool_registry, str(self.workspace))
+
+        # Wire image tool with provider for vision model access
+        self._wire_image_tool()
+
+        # Register subagent tools
+        self._register_subagent_tools()
 
         # Memory
         self._memory_store: MemoryStore | None = None
@@ -206,6 +215,92 @@ class Agent:
         from openclaw.tools.builtins.memory_tool import SAVE_DEFINITION, SEARCH_DEFINITION
         self.tool_registry.register(SEARCH_DEFINITION, memory_search, group="memory")
         self.tool_registry.register(SAVE_DEFINITION, memory_save, group="memory")
+
+    def _wire_image_tool(self) -> None:
+        """Replace image tool stub with vision-model-enabled implementation."""
+        from openclaw.tools.builtins import image_tool
+
+        provider = self.provider
+        model = self.config.models.default
+        workspace = str(self.workspace)
+
+        async def image_executor(args: dict[str, Any]) -> ToolResult:
+            return await image_tool.execute(
+                args, workspace=workspace, provider=provider, model=model
+            )
+
+        self.tool_registry.register(image_tool.DEFINITION, image_executor, group="analysis")
+
+    def _register_subagent_tools(self) -> None:
+        """Register subagent spawn/list/read tools."""
+        from openclaw.subagent.spawn import SubagentConfig, SubagentRegistry
+
+        self._subagent_registry = SubagentRegistry(SubagentConfig())
+
+        # Tool: spawn a subagent
+        spawn_def = ToolDefinition(
+            name="subagent",
+            description=(
+                "Spawn a subagent to handle a subtask autonomously. "
+                "The subagent runs with its own session and returns a result. "
+                "Use this to parallelize work or delegate complex subtasks."
+            ),
+            parameters=[
+                ToolParameter(name="task", description="The task for the subagent to perform"),
+                ToolParameter(
+                    name="model",
+                    description="Model to use (default: same as parent)",
+                    required=False,
+                ),
+            ],
+        )
+
+        agent_ref = self
+
+        async def spawn_executor(args: dict[str, Any]) -> ToolResult:
+            task = args.get("task", "")
+            model = args.get("model", "")
+            if not task:
+                return ToolResult(tool_use_id="", content="Error: task is required", is_error=True)
+
+            # Check spawn limits
+            can, reason = agent_ref._subagent_registry.can_spawn(0, "main")
+            if not can:
+                return ToolResult(tool_use_id="", content=f"Cannot spawn: {reason}", is_error=True)
+
+            # Spawn and run
+            entry = agent_ref._subagent_registry.spawn(
+                parent_session_key="main",
+                task=task,
+                depth=0,
+                model=model,
+            )
+            agent_ref._subagent_registry.mark_running(entry.id)
+
+            try:
+                result = await agent_ref.run(
+                    task,
+                    session_id=entry.session_key,
+                )
+                agent_ref._subagent_registry.mark_completed(
+                    entry.id, text=result.text, error=result.error
+                )
+                output = result.text or ""
+                if result.error:
+                    output += f"\n\nSubagent error: {result.error}"
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"[Subagent {entry.id} completed]\n\n{output}",
+                )
+            except Exception as e:
+                agent_ref._subagent_registry.mark_completed(entry.id, error=str(e))
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"Subagent failed: {e}",
+                    is_error=True,
+                )
+
+        self.tool_registry.register(spawn_def, spawn_executor, group="subagent")
 
     async def run(
         self,
