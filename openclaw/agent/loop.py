@@ -34,6 +34,7 @@ from openclaw.agent.types import (
     ToolUseBlock,
 )
 from openclaw.config import AppConfig
+from openclaw.hooks import HookRunner
 from openclaw.context.guard import ContextAction, ContextGuard
 from openclaw.model.failover import FailoverManager, classify_error, should_failover
 from openclaw.model.provider import ModelProvider, StreamChunk, parse_tool_calls_from_text
@@ -80,6 +81,7 @@ class AgentContext:
     on_thinking: Callable[[str], None] | None = None  # thinking callback
     on_tool_start: Callable[[str, dict], None] | None = None  # tool start callback
     on_tool_end: Callable[[str, ToolResult], None] | None = None  # tool end callback
+    hook_runner: HookRunner | None = None
 
 
 async def run(
@@ -117,11 +119,21 @@ async def run(
     user_msg = AgentMessage(role="user", content=user_blocks)
     ctx.session.append(user_msg)
 
+    # Fire pre_message hook
+    if ctx.hook_runner:
+        await ctx.hook_runner.fire("pre_message")
+
     # Run the attempt loop
     try:
         result = await _attempt_loop(ctx, model)
     except Exception as e:
         reason = classify_error(e)
+        if ctx.hook_runner:
+            await ctx.hook_runner.fire(
+                "on_error",
+                error_type=type(e).__name__,
+                error_message=str(e),
+            )
         if should_failover(reason):
             reason, next_model = ctx.failover.handle_error(e)
             if next_model:
@@ -130,6 +142,14 @@ async def run(
                 result.error = f"All models/profiles exhausted. Last error: {e}"
         else:
             result.error = str(e)
+
+    # Fire post_message hook
+    if ctx.hook_runner:
+        await ctx.hook_runner.fire(
+            "post_message",
+            text_length=len(result.text or ""),
+            tool_count=result.tool_calls_count,
+        )
 
     return result
 
@@ -264,9 +284,19 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
             if ctx.on_tool_start:
                 ctx.on_tool_start(tc.name, tc.input)
 
+            # Fire pre_tool_call hook
+            if ctx.hook_runner:
+                await ctx.hook_runner.fire(
+                    "pre_tool_call",
+                    tool_name=tc.name,
+                    tool_args=json.dumps(tc.input),
+                )
+
             # Execute
+            t0 = time.monotonic()
             tool_result = await ctx.tool_registry.execute(tc.name, tc.input)
             tool_result.tool_use_id = tc.id
+            tool_duration = round(time.monotonic() - t0, 3)
 
             # Guard: truncate oversized results
             max_chars = ctx.context_guard.tool_result_max_chars()
@@ -281,6 +311,13 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
                     # Force stop after critical
                     if ctx.on_tool_end:
                         ctx.on_tool_end(tc.name, tool_result)
+                    if ctx.hook_runner:
+                        await ctx.hook_runner.fire(
+                            "post_tool_call",
+                            tool_name=tc.name,
+                            status="error",
+                            duration=tool_duration,
+                        )
                     tool_result_blocks.append(
                         ToolResultBlock(
                             tool_use_id=tc.id,
@@ -299,6 +336,15 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
 
             if ctx.on_tool_end:
                 ctx.on_tool_end(tc.name, tool_result)
+
+            # Fire post_tool_call hook
+            if ctx.hook_runner:
+                await ctx.hook_runner.fire(
+                    "post_tool_call",
+                    tool_name=tc.name,
+                    status="error" if tool_result.is_error else "ok",
+                    duration=tool_duration,
+                )
 
             tool_result_blocks.append(
                 ToolResultBlock(

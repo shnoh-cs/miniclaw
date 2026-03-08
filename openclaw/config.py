@@ -26,6 +26,7 @@ class ModelsConfig(BaseModel):
     default: str = "gpt-oss-120b"
     compaction: str = ""  # falls back to default if empty
     embedding: str = "bge-m3"
+    fallback: list[str] = Field(default_factory=list)  # failover model list
     options: dict[str, ModelOptionConfig] = Field(default_factory=dict)
 
     @property
@@ -136,6 +137,15 @@ class WorkspaceConfig(BaseModel):
         return Path(self.dir).expanduser()
 
 
+class HooksConfig(BaseModel):
+    pre_tool_call: str = ""
+    post_tool_call: str = ""
+    pre_message: str = ""
+    post_message: str = ""
+    on_error: str = ""
+    timeout: int = 10
+
+
 class AppConfig(BaseModel):
     """Root configuration."""
 
@@ -149,6 +159,7 @@ class AppConfig(BaseModel):
     bootstrap: BootstrapConfig = Field(default_factory=BootstrapConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

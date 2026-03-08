@@ -9,13 +9,16 @@ from typing import Any
 
 from openclaw.agent.loop import AgentContext, run, stream_run
 from openclaw.agent.types import ThinkingLevel, ToolDefinition, ToolParameter, ToolResult
-from openclaw.config import AppConfig, load_config
+from openclaw.config import AppConfig, HooksConfig, load_config
+from openclaw.cron import CronScheduler, heartbeat_memory_check, heartbeat_model_ping
+from openclaw.hooks import HookRunner
 from openclaw.context.guard import ContextGuard
 from openclaw.memory.embeddings import EmbeddingProvider
 from openclaw.memory.search import MemorySearcher, SearchResult
 from openclaw.memory.store import MemoryStore
 from openclaw.model.provider import ModelProvider
 from openclaw.prompt.bootstrap import load_bootstrap_files
+from openclaw.session.lanes import LaneManager
 from openclaw.session.manager import SessionManager
 from openclaw.skills.loader import build_skills_prompt, load_skills
 from openclaw.tools.registry import ToolRegistry
@@ -106,11 +109,48 @@ class Agent:
         # Session
         self._sessions: dict[str, SessionManager] = {}
 
+        # Session lanes (per session)
+        self._lane_managers: dict[str, LaneManager] = {}
+
+        # Cron/heartbeat scheduler
+        self._scheduler = CronScheduler()
+
     @classmethod
     def from_config(cls, path: str | Path | None = None) -> Agent:
         """Create an Agent from a config file."""
         config = load_config(path)
         return cls(config)
+
+    def get_lane_manager(self, session_id: str = "default") -> LaneManager:
+        """Get (or create) the lane manager for a session."""
+        if session_id not in self._lane_managers:
+            self._lane_managers[session_id] = LaneManager()
+        return self._lane_managers[session_id]
+
+    @property
+    def scheduler(self) -> CronScheduler:
+        """Access the cron/heartbeat scheduler."""
+        return self._scheduler
+
+    async def start_heartbeat(self, interval: float = 120.0) -> None:
+        """Start default heartbeat tasks (model ping, memory check)."""
+        provider = self.provider
+        model = self.config.models.default
+        memory_dir = str(self.config.memory.resolved_dir)
+
+        async def _ping() -> None:
+            await heartbeat_model_ping(provider, model)
+
+        async def _mem_check() -> None:
+            await heartbeat_memory_check(memory_dir)
+
+        self._scheduler.register("model_ping", _ping, interval=interval)
+        self._scheduler.register("memory_check", _mem_check, interval=interval * 2)
+        await self._scheduler.start()
+
+    async def stop_heartbeat(self) -> None:
+        """Stop all scheduled tasks."""
+        await self._scheduler.stop()
 
     def _get_session(self, session_id: str = "default") -> SessionManager:
         if session_id not in self._sessions:
@@ -155,12 +195,17 @@ class Agent:
         if searcher:
             self._wire_memory_tools(searcher)
 
+        # Build failover manager with configured fallback models
+        from openclaw.model.failover import FailoverManager
+        failover = FailoverManager(fallback_models=list(self.config.models.fallback))
+
         return AgentContext(
             config=self.config,
             provider=self.provider,
             session=session,
             tool_registry=self.tool_registry,
             context_guard=ContextGuard(self.config.context),
+            failover=failover,
             thinking=thinking or ThinkingLevel.from_str(
                 self.config.models.options.get(
                     self.config.models.default,
@@ -171,6 +216,7 @@ class Agent:
             bootstrap_ctx=bootstrap_ctx,
             skills_prompt=skills_prompt,
             model=self.config.models.default,
+            hook_runner=HookRunner(self.config.hooks),
         )
 
     def _wire_memory_tools(self, searcher: MemorySearcher) -> None:
