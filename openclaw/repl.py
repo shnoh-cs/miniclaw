@@ -27,6 +27,7 @@ def _register_builtins(registry: ToolRegistry, workspace: str) -> None:
         apply_patch,
         bash,
         edit,
+        hancom_tool,
         image_tool,
         memory_tool,
         pdf_tool,
@@ -45,6 +46,7 @@ def _register_builtins(registry: ToolRegistry, workspace: str) -> None:
         (process_tool, "runtime"),
         (web_fetch, "web"),
         (pdf_tool, "analysis"),
+        (hancom_tool, "analysis"),
         (image_tool, "analysis"),
     ]
 
