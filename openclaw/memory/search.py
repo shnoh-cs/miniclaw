@@ -40,9 +40,17 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def bm25_rank_to_score(rank: float) -> float:
-    """Convert BM25 rank to 0..1 score."""
-    normalized = max(0, abs(rank)) if math.isfinite(rank) else 999.0
-    return 1.0 / (1.0 + normalized)
+    """Convert BM25 rank to 0..1 score.
+
+    FTS5 BM25 returns negative ranks where more negative = more relevant.
+    Matches OpenClaw: negative rank → relevance/(1+relevance).
+    """
+    if not math.isfinite(rank):
+        return 1.0 / (1.0 + 999.0)
+    if rank < 0:
+        relevance = -rank
+        return relevance / (1.0 + relevance)
+    return 1.0 / (1.0 + rank)
 
 
 def _tokenize_for_jaccard(text: str) -> set[str]:

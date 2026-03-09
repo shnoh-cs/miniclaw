@@ -261,6 +261,9 @@ python test_live.py --offline
 
 # Intelligence Eval Suite (8개 시나리오)
 python eval/eval_intelligence.py
+
+# Golden Parity Eval (원본 OpenClaw 대비 8개 섹션)
+python eval/eval_parity.py
 ```
 
 ### 테스트 구성 (`test_live.py`)
@@ -554,6 +557,244 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 | 오탐 없음 | 매번 다른 경로 20회 | True | 경로가 다르면 "반복"으로 카운트하지 않음. 20회 전부 경고 없이 통과 |
 | 핑퐁 감지 | read↔write 교대 25회 | True | 2개 도구가 번갈아 호출되는 패턴을 감지. `A→B→A→B→...` 교대 패턴은 일반 반복과 다른 감지기(ping-pong detector)가 처리 |
 
+---
+
+## Golden Parity Eval Suite (`eval/eval_parity.py`)
+
+### 설계 원칙
+
+> "원본 OpenClaw TypeScript 테스트에서 추출한 **정확한 입출력 쌍(golden data)** 으로 miniclaw의 동작이 원본과 동일한지 검증한다."
+
+원본 OpenClaw의 테스트 파일 6개에서 골든 데이터를 직접 추출:
+- `src/memory/hybrid.test.ts` — buildFtsQuery, bm25RankToScore
+- `src/memory/query-expansion.test.ts` — extractKeywords (다국어)
+- `src/memory/temporal-decay.test.ts` — 시간 감쇠 수식
+- `src/memory/mmr.test.ts` — Jaccard 유사도, MMR 재순위
+- `src/agents/failover-error.test.ts` — 에러 분류 12종
+- `src/agents/tool-loop-detection.ts` — 루프 감지 임계값
+
+### 채점 기준
+
+- 각 섹션: 0.0 ~ 1.0 점수 (개별 검증 항목의 PASS/FAIL 비율)
+- **70% 이상 = PASS**
+- API 호출 없이 100% 오프라인 실행
+
+### 최신 결과 (2026-03-09)
+
+```
+============================================================
+  OpenClaw Golden Parity Eval Suite
+============================================================
+
+  원본 OpenClaw TypeScript 테스트와 동일 입출력 검증
+  임계: 70% 이상 = PASS
+
+  100%  1. buildFtsQuery (OK, OK, OK, OK, OK)
+  100%  2. bm25RankToScore (rank0=OK, rank1=OK, rank-4.2=OK, rank-2.1=OK, rank-0.5=OK, monotonic=OK)
+  100%  3. extractKeywords (expand_query) (en_basic=OK, ko_basic=OK, ko_particle=OK, ko_allstop=OK, ko_mixed=OK, zh_basic=OK, empty=OK, en_allstop=OK, dedup=OK)
+  100%  4. Temporal Decay (halflife=OK, 10days=OK, evergreen=OK)
+  100%  5. Jaccard 유사도 (identical=OK, disjoint=OK, both_empty=OK, one_empty=OK, partial=OK, symmetric=OK)
+  100%  6. MMR 다양성 재순위 (lambda1=OK, lambda0=OK, diversity=OK, dedup=OK)
+  100%  7. Failover 에러 분류 (12/12 matched)
+  100%  8. 루프 감지 임계값 (warn_at=10=OK, critical_at=30=OK, no_false_pos=OK)
+
+  전체 평균: 100%
+  PASS (>=70%): 8개
+
+  ALL PASS!
+
+  [██████████████████████████████] 100%  1. buildFtsQuery
+  [██████████████████████████████] 100%  2. bm25RankToScore
+  [██████████████████████████████] 100%  3. extractKeywords (expand_query)
+  [██████████████████████████████] 100%  4. Temporal Decay
+  [██████████████████████████████] 100%  5. Jaccard 유사도
+  [██████████████████████████████] 100%  6. MMR 다양성 재순위
+  [██████████████████████████████] 100%  7. Failover 에러 분류
+  [██████████████████████████████] 100%  8. 루프 감지 임계값
+```
+
+### 섹션 상세
+
+---
+
+#### 섹션 1: buildFtsQuery — 100%
+
+**검증 대상**: `openclaw.memory.search.build_fts_query()` — 자연어 쿼리를 SQLite FTS5 형식으로 변환
+
+**원본**: `src/memory/hybrid.test.ts`의 `buildFtsQuery` 테스트
+
+**골든 데이터 (원본 TypeScript 테스트에서 추출)**:
+
+| 입력 | 기대 출력 (OpenClaw) | miniclaw 출력 | 일치 |
+|------|----------------------|---------------|------|
+| `"hello world"` | `'"hello" AND "world"'` | `'"hello" AND "world"'` | OK |
+| `"FOO_bar baz-1"` | `'"FOO_bar" AND "baz" AND "1"'` | `'"FOO_bar" AND "baz" AND "1"'` | OK |
+| `"金银价格"` | `'"金银价格"'` | `'"金银价格"'` | OK |
+| `"価格 2026年"` | `'"価格" AND "2026年"'` | `'"価格" AND "2026年"'` | OK |
+| `"   "` (공백만) | `None` | `None` | OK |
+
+**동작 원리**: 정규식 `[\p{L}\p{N}_]+`로 토큰 추출 → 각 토큰을 `"토큰"`으로 감싸고 `AND`로 결합. CJK 문자도 Latin과 동일하게 처리.
+
+---
+
+#### 섹션 2: bm25RankToScore — 100%
+
+**검증 대상**: `openclaw.memory.search.bm25_rank_to_score()` — FTS5 BM25 랭크를 0~1 점수로 변환
+
+**원본**: `src/memory/hybrid.test.ts`의 `bm25RankToScore` 테스트
+
+**골든 데이터**:
+
+| 입력 (rank) | 기대 출력 (OpenClaw) | miniclaw 출력 | 일치 |
+|-------------|---------------------|---------------|------|
+| `0` | `1.0` (1/(1+0)) | `1.0` | OK |
+| `1` | `0.5` (1/(1+1)) | `0.5` | OK |
+| `-4.2` | `0.8077` (4.2/5.2) | `0.8077` | OK |
+| `-2.1` | `0.6774` (2.1/3.1) | `0.6774` | OK |
+| `-0.5` | `0.3333` (0.5/1.5) | `0.3333` | OK |
+| 단조성 검증 | `-4.2 > -2.1 > -0.5` | `0.808 > 0.677 > 0.333` | OK |
+
+**핵심 공식** (OpenClaw `bm25RankToScore`와 동일):
+- rank < 0 (FTS5 기본값): `relevance = -rank` → `relevance / (1 + relevance)`
+- rank >= 0: `1 / (1 + rank)`
+- 더 음수 = 더 관련성 높음 → 더 높은 점수
+
+**이 테스트로 발견된 버그**: miniclaw 초기 구현은 모든 rank에 `1/(1+abs(rank))`를 사용했다. rank=-4.2에서 miniclaw=0.192 vs OpenClaw=0.808 — 관련성 순서가 완전히 뒤집혀 있었다. 이 골든 테스트로 발견 → 수정.
+
+---
+
+#### 섹션 3: extractKeywords (expand_query) — 100%
+
+**검증 대상**: `openclaw.memory.search.expand_query()` — 쿼리에서 스톱워드 제거, 한국어 조사 스트리핑, 중국어 바이그램 추출
+
+**원본**: `src/memory/query-expansion.test.ts`
+
+**골든 데이터**:
+
+| 테스트 | 입력 | 기대 동작 | 결과 |
+|--------|------|-----------|------|
+| en_basic | `"that thing we discussed about the API"` | "discussed", "api" 포함, "that"/"the" 등 스톱워드 제거 | OK |
+| ko_basic | `"어제 논의한 배포 전략"` | "논의한", "배포", "전략" 포함, "어제" 스톱워드 제거 | OK |
+| ko_particle | `"서버에서 발생한 에러를 확인"` | "서버", "에러", "확인" 포함 (조사 "에서", "를" 스트리핑) | OK |
+| ko_allstop | `"나는 그리고 그래서"` | 전부 스톱워드 → 빈 결과 (폴백으로 원문 반환) | OK |
+| ko_mixed | `"API를 배포했다"` | "api", "배포했다" 포함 (한글 조사 "를" 스트리핑) | OK |
+| zh_basic | `"昨天讨论的 API design"` | "api", "design" 포함 | OK |
+| empty | `""` | 빈 입력 처리 | OK |
+| en_allstop | `"the a an is are"` | 전부 스톱워드 → 빈 결과 (폴백) | OK |
+| dedup | `"test test testing"` | "test" 중복 제거 | OK |
+
+**다국어 스톱워드**: EN (the, is, are, ...) / KO (어제, 오늘, 나는, ...) / ZH (的, 是, 了, ...) / JA (の, は, が, ...) / ES / PT / AR
+
+---
+
+#### 섹션 4: Temporal Decay — 100%
+
+**검증 대상**: `openclaw.memory.search.apply_temporal_decay()` — 시간 기반 점수 감쇠
+
+**원본**: `src/memory/temporal-decay.test.ts`의 `calculateTemporalDecayMultiplier`
+
+**핵심 공식**: `multiplier = exp(-λ × age_days)` where `λ = ln(2) / half_life_days`
+
+**골든 데이터**:
+
+| 테스트 | 입력 | 기대 출력 | miniclaw 출력 | 일치 |
+|--------|------|-----------|---------------|------|
+| 반감기 검증 | age=30일, halfLife=30 | `0.5` (정확히 절반) | `0.5` | OK |
+| 10일 경과 | age=10일, halfLife=30 | `0.7943` (exp(-ln2/30×10)) | `0.7943` | OK |
+| MEMORY.md 불멸 | age=365일, path=`MEMORY.md` | `1.0` (감쇠 없음) | `1.0` | OK |
+
+**MEMORY.md가 감쇠하지 않는 이유**: MEMORY.md는 큐레이션으로 승격된 영구 지식이므로, 시간이 지나도 점수가 감소하면 안 된다. 파일 경로에 `MEMORY.md`가 포함되면 감쇠 승수를 1.0으로 고정.
+
+---
+
+#### 섹션 5: Jaccard 유사도 — 100%
+
+**검증 대상**: `openclaw.memory.search._jaccard_similarity()` — 두 텍스트의 단어 집합 유사도
+
+**원본**: `src/memory/mmr.test.ts`의 `jaccardSimilarity`
+
+**골든 데이터**:
+
+| 테스트 | 입력 A | 입력 B | 기대 | miniclaw | 일치 |
+|--------|--------|--------|------|----------|------|
+| identical | `"a b c"` | `"a b c"` | `1.0` | `1.0` | OK |
+| disjoint | `"a b"` | `"c d"` | `0.0` | `0.0` | OK |
+| both_empty | `""` | `""` | `1.0` | `1.0` | OK |
+| one_empty | `"a"` | `""` | `0.0` | `0.0` | OK |
+| partial | `"a b c"` | `"b c d"` | `0.5` ({b,c}/{a,b,c,d}) | `0.5` | OK |
+| symmetric | `"a b"`, `"b c"` vs `"b c"`, `"a b"` | 동일 | 동일 | OK |
+
+---
+
+#### 섹션 6: MMR 다양성 재순위 — 100%
+
+**검증 대상**: `openclaw.memory.search.apply_mmr()` — Maximal Marginal Relevance 재순위
+
+**원본**: `src/memory/mmr.test.ts`의 `mmrRerank`
+
+**골든 데이터**:
+
+| 테스트 | 입력 | lambda | 기대 순서 | miniclaw 순서 | 일치 |
+|--------|------|--------|-----------|---------------|------|
+| lambda=1 (순수 관련성) | A(1.0), B(0.9), C(0.8) | 1.0 | A→B→C | A→B→C | OK |
+| lambda=0 (순수 다양성) | A="apple banana cherry"(1.0), B="apple banana date"(0.9), C="elderberry fig grape"(0.8) | 0.0 | A→C (C가 A와 가장 다름) | A→C→B | OK |
+| 주제 다양성 | ML1(1.0), ML2(0.95), DB(0.9), ML3(0.85) | 0.5 | ML1→DB (ML 다음엔 다른 주제) | ML1→DB→ML2→ML3 | OK |
+| 동일 내용 중복 제거 | A="identical"(1.0), B="identical"(0.9), C="different"(0.8) | 0.5 | A→C (B는 A와 동일) | A→C→B | OK |
+
+**MMR 공식**: `score(d) = λ × relevance(d) - (1-λ) × max_sim(d, selected)` — lambda가 높으면 관련성 우선, 낮으면 다양성 우선.
+
+---
+
+#### 섹션 7: Failover 에러 분류 — 100%
+
+**검증 대상**: `openclaw.model.failover.classify_error()` — 에러 메시지 → FailoverReason 분류
+
+**원본**: `src/agents/failover-error.test.ts`
+
+**골든 데이터 (12개 에러 + 1개 정책 확인)**:
+
+| 에러 메시지 | 기대 분류 (OpenClaw) | miniclaw 분류 | 일치 |
+|-------------|---------------------|---------------|------|
+| `"Rate limit exceeded (429)"` | RATE_LIMIT | RATE_LIMIT | OK |
+| `"429 Too Many Requests"` | RATE_LIMIT | RATE_LIMIT | OK |
+| `"Service overloaded (503)"` | OVERLOADED | OVERLOADED | OK |
+| `"overloaded_error"` | OVERLOADED | OVERLOADED | OK |
+| `"context_length_exceeded"` | CONTEXT_OVERFLOW | CONTEXT_OVERFLOW | OK |
+| `"Connection error."` | TIMEOUT | TIMEOUT | OK |
+| `"fetch failed"` | TIMEOUT | TIMEOUT | OK |
+| `"ETIMEDOUT"` | TIMEOUT | TIMEOUT | OK |
+| `"ECONNRESET"` | TIMEOUT | TIMEOUT | OK |
+| `"credit balance too low"` | BILLING | BILLING | OK |
+| `"insufficient credits"` | BILLING | BILLING | OK |
+| CONTEXT_OVERFLOW → 페일오버 안 함 | `should_failover = false` | `should_failover = False` | OK |
+
+**이 테스트로 발견된 버그**: `"ETIMEDOUT"`은 Node.js 에러 코드인데 "timeout" 문자열을 포함하지 않아서 기존 타임아웃 패턴에 매칭되지 않았다. `\betimedout\b` 패턴을 `_TIMEOUT_PATTERNS`에 추가하여 해결.
+
+---
+
+#### 섹션 8: 루프 감지 임계값 — 100%
+
+**검증 대상**: `openclaw.tools.registry.ToolLoopDetector` — 반복 도구 호출 감지 임계값
+
+**원본**: `src/agents/tool-loop-detection.ts`의 임계값 상수
+
+**골든 데이터**:
+
+| 테스트 | 입력 | OpenClaw 기대 | miniclaw 동작 | 일치 |
+|--------|------|---------------|---------------|------|
+| WARNING 시점 | 동일 도구+인풋 반복 | 10회에서 WARNING | 10회에서 `"WARNING: You have called read 10 times with identical arguments"` | OK |
+| CRITICAL 시점 | 동일 도구+인풋 반복 | 30회에서 CRITICAL (global circuit breaker) | 30회에서 `"CRITICAL: ..."` | OK |
+| 오탐 없음 | 매번 다른 경로 20회 | 경고 없음 | 경고 없음 | OK |
+
+**OpenClaw 임계값**: `WARNING_THRESHOLD=10`, `CRITICAL_THRESHOLD=20`, `GLOBAL_CIRCUIT_BREAKER_THRESHOLD=30`
+
+### 골든 테스트로 발견·수정된 버그
+
+| 버그 | 파일 | 원인 | 수정 |
+|------|------|------|------|
+| bm25_rank_to_score 역전 | `openclaw/memory/search.py` | 음수 rank에 `1/(1+abs(rank))` 사용 → rank=-4.2에서 0.192 (OpenClaw=0.808) | `relevance/(1+relevance)` 공식으로 교체 |
+| ETIMEDOUT 미분류 | `openclaw/model/failover.py` | "ETIMEDOUT"에 "timeout" 미포함 → UNKNOWN 분류 | `\betimedout\b` 패턴 추가 |
+
 ## 프로젝트 구조
 
 ```
@@ -575,7 +816,10 @@ miniclaw/
 │   ├── cron/               #   Cron/Heartbeat
 │   ├── config.py           #   TOML 설정
 │   └── repl.py             #   대화형 REPL
-├── test_live.py            # 테스트 (45개)
+├── eval/                   # Eval Suites
+│   ├── eval_intelligence.py  # Intelligence Eval (8개 시나리오)
+│   └── eval_parity.py        # Golden Parity Eval (8개 섹션)
+├── test_live.py            # 테스트 (57개: 오프라인 44 + 라이브 13)
 ├── config.example.toml     # 설정 예시
 ├── pyproject.toml          # 빌드 설정
 └── CLAUDE.md               # 개발 컨텍스트

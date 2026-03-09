@@ -84,6 +84,7 @@ _TIMEOUT_PATTERNS: list[_ErrorPattern] = [
     "fetch failed",
     "socket hang up",
     re.compile(r"\beconn(?:refused|reset|aborted)\b", re.IGNORECASE),
+    re.compile(r"\betimedout\b", re.IGNORECASE),
     re.compile(r"\benotfound\b", re.IGNORECASE),
     re.compile(r"\beai_again\b", re.IGNORECASE),
     re.compile(r"without sending (?:any )?chunks?", re.IGNORECASE),
