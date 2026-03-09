@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -70,6 +71,11 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS fts_index (
                 id INTEGER PRIMARY KEY,
                 text TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
         """)
 
@@ -236,6 +242,66 @@ class MemoryStore:
             (text_hash, embedding.tobytes(), time.time()),
         )
         conn.commit()
+
+    def get_metadata(self, key: str) -> str | None:
+        """Get a metadata value by key."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key=?", (key,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_metadata(self, key: str, value: str) -> None:
+        """Set a metadata value."""
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
+
+    @staticmethod
+    def compute_fingerprint(
+        embedding_model: str,
+        base_url: str,
+        chunk_size: int,
+        chunk_overlap: int,
+    ) -> str:
+        """Compute a fingerprint from embedding config for change detection.
+
+        If any of these parameters change, existing embeddings are incompatible
+        and the entire index must be rebuilt.
+        """
+        raw = f"{embedding_model}|{base_url}|{chunk_size}|{chunk_overlap}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    def check_fingerprint(self, fingerprint: str) -> bool:
+        """Check if stored fingerprint matches. Returns True if match or first run."""
+        stored = self.get_metadata("embedding_fingerprint")
+        if stored is None:
+            # First run — store and continue
+            self.set_metadata("embedding_fingerprint", fingerprint)
+            return True
+        return stored == fingerprint
+
+    def reset_index(self, new_fingerprint: str) -> None:
+        """Drop all chunks and embedding cache, store new fingerprint.
+
+        Called when embedding model/endpoint/chunking config changes.
+        """
+        self._invalidate_embedding_cache()
+        conn = self._get_conn()
+        conn.executescript("""
+            DELETE FROM chunks;
+            DELETE FROM embedding_cache;
+            DELETE FROM fts_index;
+        """)
+        try:
+            conn.execute("DELETE FROM fts_search")
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        self.set_metadata("embedding_fingerprint", new_fingerprint)
 
     def close(self) -> None:
         if self._conn:

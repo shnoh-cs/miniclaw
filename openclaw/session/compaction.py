@@ -523,17 +523,51 @@ def _write_checkpoint(messages: list[AgentMessage], workspace_dir: str) -> None:
         pass
 
 
+def _compute_keep_count(
+    messages: list[AgentMessage],
+    reserve_tokens_floor: int,
+) -> int:
+    """Dynamically compute how many recent messages to keep during compaction.
+
+    Instead of a fixed keep_count=4, this mirrors the original OpenClaw behavior
+    of using reserveTokensFloor to determine how many recent messages fit within
+    the reserved space.  We walk backwards from the end, accumulating token
+    estimates, and stop when we'd exceed the floor budget.
+
+    Returns at least 2 (one user + one assistant turn).
+    """
+    keep = 0
+    budget = reserve_tokens_floor
+    for msg in reversed(messages):
+        msg_tokens = _estimate_tokens(msg.text)
+        for tu in msg.tool_uses:
+            try:
+                msg_tokens += _estimate_tokens(json.dumps(tu.input))
+            except Exception:
+                msg_tokens += 32
+        for tr in msg.tool_results:
+            msg_tokens += _estimate_tokens(tr.content)
+        if keep >= 2 and msg_tokens > budget:
+            break
+        budget -= msg_tokens
+        keep += 1
+        if budget <= 0:
+            break
+    return max(2, keep)
+
+
 async def compact_session(
     session: SessionManager,
     provider: ModelProvider,
     config: CompactionConfig,
     context_max_tokens: int,
     workspace_dir: str = "",
+    reserve_tokens_floor: int = 20000,
 ) -> CompactionEntry | None:
     """Perform multi-stage compaction on the session.
 
     1. Estimate tokens of all messages
-    2. Determine how many old messages to summarize
+    2. Determine how many old messages to summarize (dynamic keep_count)
     3. Generate summary (multi-stage if needed)
     4. Validate with safeguard (if enabled)
     5. Replace old messages with summary
@@ -549,8 +583,8 @@ async def compact_session(
     tokens_before = session.estimate_tokens()
     target_tokens = int(context_max_tokens * 0.5)  # aim for 50% utilization
 
-    # Find split point: keep recent messages, summarize old ones
-    keep_count = 4  # minimum messages to keep (2 turns)
+    # Dynamic keep_count based on reserve_tokens_floor (instead of fixed 4)
+    keep_count = _compute_keep_count(messages, reserve_tokens_floor)
     summarize_msgs = messages[:-keep_count] if len(messages) > keep_count else []
 
     if not summarize_msgs:

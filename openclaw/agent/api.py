@@ -175,11 +175,25 @@ class Agent:
     def _get_memory_searcher(self) -> MemorySearcher | None:
         if self._memory_store is None:
             try:
-                from openclaw.memory.search import FileWatcher
+                from openclaw.memory.search import FileWatcher, Reranker
 
                 db_path = self.config.memory.resolved_dir / "memory.sqlite"
                 self._memory_store = MemoryStore(db_path)
                 self._embedding_provider = EmbeddingProvider(self.config)
+
+                # Fingerprint check: auto-reset index on embedding config change
+                fingerprint = MemoryStore.compute_fingerprint(
+                    embedding_model=self.config.models.embedding,
+                    base_url=self.config.endpoints.embedding.base_url,
+                    chunk_size=self.config.memory.chunk_size,
+                    chunk_overlap=self.config.memory.chunk_overlap,
+                )
+                if not self._memory_store.check_fingerprint(fingerprint):
+                    import logging
+                    logging.getLogger("openclaw.memory").warning(
+                        "Embedding config changed, resetting index for full re-indexing"
+                    )
+                    self._memory_store.reset_index(fingerprint)
 
                 # Create FileWatcher and register existing memory files
                 watcher = FileWatcher(debounce_seconds=30.0)
@@ -192,11 +206,15 @@ class Agent:
                 if workspace_memory.exists():
                     watcher.register(workspace_memory)
 
+                # Reranker (uses same embedding provider as cross-encoder proxy)
+                reranker = Reranker(self._embedding_provider)
+
                 self._memory_searcher = MemorySearcher(
                     self._memory_store,
                     self._embedding_provider,
                     self.config.memory,
                     file_watcher=watcher,
+                    reranker=reranker,
                 )
             except Exception:
                 return None

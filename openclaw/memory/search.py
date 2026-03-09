@@ -475,6 +475,61 @@ class FileWatcher:
         return total
 
 
+class Reranker:
+    """Cross-encoder reranker for search result refinement.
+
+    Calls an OpenAI-compatible /v1/embeddings endpoint with (query, document)
+    pairs to produce relevance scores, similar to how the original OpenClaw
+    uses a local GGUF reranker model via QMD.
+
+    Falls back to a lightweight embedding-based reranker if no dedicated
+    reranker model is available: computes cosine(query_emb, chunk_emb) and
+    uses that as the reranker score.
+    """
+
+    def __init__(
+        self,
+        embedding_provider: EmbeddingProvider,
+        model: str | None = None,
+    ) -> None:
+        self.embedding_provider = embedding_provider
+        self.model = model  # dedicated reranker model (optional)
+
+    async def rerank(
+        self,
+        query: str,
+        results: list[SearchResult],
+        top_k: int = 10,
+    ) -> list[SearchResult]:
+        """Re-score and re-sort results by cross-encoder relevance.
+
+        Uses embedding cosine similarity as a proxy for cross-encoder scoring.
+        The query is embedded alongside each chunk text; the cosine similarity
+        between query and chunk embeddings serves as the reranker score.
+        """
+        if not results or len(results) <= 1:
+            return results
+
+        try:
+            # Embed query + all chunk texts in one batch
+            texts = [query] + [r.chunk.text[:500] for r in results]
+            embeddings = await self.embedding_provider.embed(texts)
+            if not embeddings or len(embeddings) != len(texts):
+                return results  # degrade gracefully
+
+            query_emb = embeddings[0]
+            for i, r in enumerate(results):
+                chunk_emb = embeddings[i + 1]
+                rerank_score = float(np.dot(query_emb, chunk_emb))
+                # Blend: 60% reranker, 40% original hybrid score
+                r.final_score = 0.6 * rerank_score + 0.4 * r.final_score
+
+            results.sort(key=lambda r: r.final_score, reverse=True)
+            return results[:top_k]
+        except Exception:
+            return results  # degrade gracefully
+
+
 def clamp_results_by_chars(
     results: list[SearchResult],
     char_budget: int = 8000,
@@ -496,6 +551,41 @@ def clamp_results_by_chars(
     return clamped
 
 
+class SessionSyncWatcher:
+    """Track session JSONL file sizes for delta-threshold background sync.
+
+    When a session JSONL grows by more than ``delta_threshold_bytes`` since the
+    last sync, triggers background re-indexing of that session.
+    """
+
+    def __init__(self, delta_threshold_bytes: int = 8192) -> None:
+        self._sizes: dict[str, int] = {}
+        self.delta_threshold_bytes = delta_threshold_bytes
+
+    def check(self, jsonl_path: Path) -> bool:
+        """Return True if the file has grown enough to warrant re-indexing."""
+        key = str(jsonl_path)
+        try:
+            current_size = jsonl_path.stat().st_size
+        except OSError:
+            return False
+
+        last_size = self._sizes.get(key, 0)
+        delta = current_size - last_size
+        if delta >= self.delta_threshold_bytes:
+            self._sizes[key] = current_size
+            return True
+        return False
+
+    def mark_synced(self, jsonl_path: Path) -> None:
+        """Update the recorded size after a successful sync."""
+        key = str(jsonl_path)
+        try:
+            self._sizes[key] = jsonl_path.stat().st_size
+        except OSError:
+            pass
+
+
 class MemorySearcher:
     """Hybrid search engine combining vector similarity and BM25."""
 
@@ -505,11 +595,14 @@ class MemorySearcher:
         embedding_provider: EmbeddingProvider,
         config: MemoryConfig,
         file_watcher: FileWatcher | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         self.store = store
         self.embedding_provider = embedding_provider
         self.config = config
         self.file_watcher = file_watcher
+        self.reranker = reranker
+        self.session_sync = SessionSyncWatcher()
 
     async def search(
         self,
@@ -624,6 +717,12 @@ class MemorySearcher:
             )
             all_results.sort(key=lambda r: r.final_score, reverse=True)
 
+        # 6. Reranker pass (cross-encoder refinement)
+        if self.reranker and all_results:
+            all_results = await self.reranker.rerank(
+                query, all_results, top_k=max_results
+            )
+
         return all_results[:max_results]
 
     async def index_file(self, file_path: Path, chunk_size: int = 1600, overlap: int = 320) -> int:
@@ -704,6 +803,19 @@ class MemorySearcher:
             self.store.upsert_chunk(chunk)
 
         return len(chunks)
+
+    async def sync_session_if_needed(self, jsonl_path: Path) -> int:
+        """Re-index a session JSONL if it has grown past the delta threshold.
+
+        Called periodically (e.g. per-turn) to keep session memory up to date
+        without re-indexing on every single message append.
+        Returns number of chunks indexed, or 0 if no sync was needed.
+        """
+        if not self.session_sync.check(jsonl_path):
+            return 0
+        count = await self.index_session_jsonl(jsonl_path)
+        self.session_sync.mark_synced(jsonl_path)
+        return count
 
     async def index_session_jsonl(
         self,

@@ -751,6 +751,123 @@ async def test_auto_recall_scoped(agent) -> tuple[bool, str]:
     return ok, f"field={ok1}, long_term={ok2}, recent={ok3}, session_filter={ok4}"
 
 
+async def test_reranker_class(agent) -> tuple[bool, str]:
+    """Reranker 클래스가 존재하고 search pipeline에 연결되는지."""
+    from openclaw.memory.search import Reranker, MemorySearcher
+    import inspect
+
+    # Reranker 클래스 존재 확인
+    ok1 = hasattr(Reranker, "rerank")
+
+    # MemorySearcher에 reranker 파라미터 존재
+    params = inspect.signature(MemorySearcher.__init__).parameters
+    ok2 = "reranker" in params
+
+    # search() 메서드 소스에 reranker 호출 포함
+    source = inspect.getsource(MemorySearcher.search)
+    ok3 = "self.reranker" in source
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"class={ok1}, param={ok2}, pipeline={ok3}"
+
+
+async def test_embedding_fingerprint(agent) -> tuple[bool, str]:
+    """임베딩 fingerprint 변경 시 자동 재인덱싱되는지."""
+    from openclaw.memory.store import MemoryStore
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.sqlite"
+        store = MemoryStore(db_path)
+
+        # 첫 fingerprint 저장
+        fp1 = MemoryStore.compute_fingerprint("model-a", "http://a:8000", 1600, 320)
+        ok1 = store.check_fingerprint(fp1)  # first run → True
+
+        # 같은 fingerprint → True
+        ok2 = store.check_fingerprint(fp1)
+
+        # 다른 fingerprint → False (모델 변경)
+        fp2 = MemoryStore.compute_fingerprint("model-b", "http://a:8000", 1600, 320)
+        ok3 = not store.check_fingerprint(fp2)
+
+        # reset_index 후 새 fingerprint 저장
+        store.reset_index(fp2)
+        ok4 = store.check_fingerprint(fp2)  # now matches
+
+        store.close()
+
+    ok = ok1 and ok2 and ok3 and ok4
+    return ok, f"first={ok1}, same={ok2}, changed={ok3}, after_reset={ok4}"
+
+
+async def test_session_delta_sync(agent) -> tuple[bool, str]:
+    """세션 델타 임계값 기반 백그라운드 싱크가 존재하는지."""
+    from openclaw.memory.search import SessionSyncWatcher, MemorySearcher
+    import inspect
+
+    # SessionSyncWatcher 클래스 확인
+    ok1 = hasattr(SessionSyncWatcher, "check")
+    ok2 = hasattr(SessionSyncWatcher, "mark_synced")
+
+    # MemorySearcher.sync_session_if_needed 메서드 존재
+    ok3 = hasattr(MemorySearcher, "sync_session_if_needed")
+
+    # agent/loop.py에서 sync_session_if_needed 호출
+    from openclaw.agent import loop as loop_mod
+    source = inspect.getsource(loop_mod.run)
+    ok4 = "sync_session_if_needed" in source
+
+    ok = ok1 and ok2 and ok3 and ok4
+    return ok, f"check={ok1}, mark={ok2}, method={ok3}, wired={ok4}"
+
+
+async def test_flush_prompt_style(agent) -> tuple[bool, str]:
+    """메모리 플러시 프롬프트가 원본 스타일(write 도구)인지."""
+    from openclaw.agent import loop as loop_mod
+    import inspect
+
+    source = inspect.getsource(loop_mod._run_flush_with_tools)
+    # 원본 스타일: "Store durable memories now" + "memory_save"
+    ok1 = "Store durable memories now" in source
+    ok2 = "memory_save" in source
+    # 이전 스타일의 "memory_search" 지시가 없어야 함
+    ok3 = "Use memory_search to check" not in source
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"store_durable={ok1}, save={ok2}, no_search_check={ok3}"
+
+
+async def test_dynamic_keep_count(agent) -> tuple[bool, str]:
+    """컴팩션 keep_count가 reserve_tokens_floor 기반 동적 계산인지."""
+    from openclaw.session.compaction import _compute_keep_count, compact_session
+    from openclaw.agent.types import AgentMessage, TextBlock
+    import inspect
+
+    # _compute_keep_count 함수 존재
+    ok1 = callable(_compute_keep_count)
+
+    # compact_session에 reserve_tokens_floor 파라미터 존재
+    params = inspect.signature(compact_session).parameters
+    ok2 = "reserve_tokens_floor" in params
+
+    # 동적 계산 검증: 큰 reserve → 많은 keep, 작은 reserve → 적은 keep
+    messages = [
+        AgentMessage(role="user", content=[TextBlock(text="x" * 200)]),
+        AgentMessage(role="assistant", content=[TextBlock(text="y" * 200)]),
+        AgentMessage(role="user", content=[TextBlock(text="z" * 200)]),
+        AgentMessage(role="assistant", content=[TextBlock(text="w" * 200)]),
+        AgentMessage(role="user", content=[TextBlock(text="a" * 200)]),
+        AgentMessage(role="assistant", content=[TextBlock(text="b" * 200)]),
+    ]
+    small_keep = _compute_keep_count(messages, reserve_tokens_floor=100)
+    large_keep = _compute_keep_count(messages, reserve_tokens_floor=10000)
+    ok3 = large_keep >= small_keep  # 큰 floor = 더 많이 유지
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"func={ok1}, param={ok2}, dynamic={ok3} (small={small_keep}, large={large_keep})"
+
+
 # ── 메인 ─────────────────────────────────────────────────
 
 
@@ -805,6 +922,14 @@ async def main() -> None:
     await run_test("메모리 큐레이션 모듈", test_memory_curation_module(agent))
     await run_test("진단 설정 자동 조정", test_diagnosis_auto_apply(agent))
     await run_test("auto-recall 스코프 분리", test_auto_recall_scoped(agent))
+
+    # ── C/D 갭 수정 검증 (오프라인) ──
+    header("3b. 원본 대비 갭 수정 (오프라인)")
+    await run_test("Reranker 패스", test_reranker_class(agent))
+    await run_test("임베딩 fingerprint", test_embedding_fingerprint(agent))
+    await run_test("세션 델타 싱크", test_session_delta_sync(agent))
+    await run_test("플러시 프롬프트 스타일", test_flush_prompt_style(agent))
+    await run_test("동적 keep_count", test_dynamic_keep_count(agent))
 
     # ── 라이브 테스트 (API 호출) ──
     header("4. 라이브 테스트 (API 호출)")

@@ -124,14 +124,11 @@ async def _run_flush_with_tools(ctx: AgentContext, model: str) -> str | None:
 
     date_str = datetime.date.today().isoformat()
     flush_prompt = (
-        f"Pre-compaction memory flush. Recent conversation:\n\n"
+        f"Store durable memories now. Recent conversation:\n\n"
         f"{conv_summary}\n\n"
-        f"Instructions:\n"
-        f"1. Use memory_search to check what's already saved\n"
-        f"2. Use memory_save (file: {date_str}.md) to store new durable "
-        f"facts, decisions, or preferences\n"
-        f"3. Avoid saving duplicates of existing memories\n"
-        f"4. Reply with NO_REPLY if nothing important to save"
+        f"Write any lasting notes (facts, decisions, user preferences) to "
+        f"memory/{date_str}.md using memory_save.\n"
+        f"Reply with NO_REPLY if nothing important to save."
     )
 
     try:
@@ -218,6 +215,15 @@ async def run(
     user_blocks: list[ContentBlock] = [TextBlock(text=clean_input)]
     user_msg = AgentMessage(role="user", content=user_blocks)
     ctx.session.append(user_msg)
+
+    # Session delta sync: re-index current session JSONL if it has grown enough
+    if ctx.memory_searcher:
+        try:
+            jsonl_path = ctx.session.session_dir / f"{ctx.session.session_id}.jsonl"
+            if jsonl_path.exists():
+                await ctx.memory_searcher.sync_session_if_needed(jsonl_path)
+        except Exception:
+            pass
 
     # Auto-recall: scope-aware memory search (long-term / episodic / session)
     if ctx.memory_searcher and len(clean_input) >= 10:
@@ -319,6 +325,7 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
                 ctx.session, ctx.provider, ctx.config.compaction,
                 ctx.config.context.max_tokens,
                 workspace_dir=ctx.workspace_dir,
+                reserve_tokens_floor=ctx.config.context.reserve_tokens_floor,
             )
             if entry:
                 result.compacted = True
@@ -330,6 +337,7 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
                 ctx.session, ctx.provider, ctx.config.compaction,
                 ctx.config.context.max_tokens,
                 workspace_dir=ctx.workspace_dir,
+                reserve_tokens_floor=ctx.config.context.reserve_tokens_floor,
             )
             if entry:
                 result.compacted = True
