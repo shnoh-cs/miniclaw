@@ -12,13 +12,17 @@ This is the heart of the agent harness. It orchestrates:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import re
 import time
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from openclaw.memory.search import MemorySearcher
 
 from openclaw.agent.types import (
     AgentMessage,
@@ -94,6 +98,93 @@ class AgentContext:
     on_tool_start: Callable[[str, dict], None] | None = None  # tool start callback
     on_tool_end: Callable[[str, ToolResult], None] | None = None  # tool end callback
     hook_runner: HookRunner | None = None
+    memory_searcher: MemorySearcher | None = None  # for post-flush re-indexing
+    auto_recall_context: str = ""  # auto-recalled memory snippets injected per turn
+    recovery_checkpoint: str = ""  # post-compaction checkpoint for context recovery
+
+
+async def _run_flush_with_tools(ctx: AgentContext, model: str) -> str | None:
+    """Run memory flush through agent loop with tool access.
+
+    Unlike plain text flush, this lets the model:
+    1. Search existing memories (memory_search) to avoid duplicates
+    2. Save structured memories (memory_save) with proper formatting
+    Falls back to plain completion on failure.
+    """
+    import tempfile
+
+    # Build conversation summary for flush context
+    recent = ctx.session.messages[-20:]
+    conv_lines = []
+    for m in recent:
+        text = m.text[:500]
+        if text:
+            conv_lines.append(f"[{m.role}] {text}")
+    conv_summary = "\n".join(conv_lines)
+
+    date_str = datetime.date.today().isoformat()
+    flush_prompt = (
+        f"Pre-compaction memory flush. Recent conversation:\n\n"
+        f"{conv_summary}\n\n"
+        f"Instructions:\n"
+        f"1. Use memory_search to check what's already saved\n"
+        f"2. Use memory_save (file: {date_str}.md) to store new durable "
+        f"facts, decisions, or preferences\n"
+        f"3. Avoid saving duplicates of existing memories\n"
+        f"4. Reply with NO_REPLY if nothing important to save"
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            flush_session = SessionManager(Path(tmpdir), f"flush-{int(time.time())}")
+            flush_session._loaded = True
+
+            # Add flush prompt as user message
+            flush_user = AgentMessage(
+                role="user", content=[TextBlock(text=flush_prompt)]
+            )
+            flush_session.messages.append(flush_user)
+
+            flush_ctx = replace(
+                ctx,
+                session=flush_session,
+                bootstrap_ctx=None,
+                skills_prompt="",
+                loop_detector=ToolLoopDetector(),
+                pruning_state=PruningState(),
+                on_stream=None,
+                on_thinking=None,
+                on_tool_start=None,
+                on_tool_end=None,
+                auto_recall_context="",
+                recovery_checkpoint="",
+            )
+
+            result = await _attempt_loop(flush_ctx, model)
+            text = result.text or ""
+            if text.strip().upper() == NO_REPLY:
+                return None
+            return text
+    except Exception:
+        # Fallback: plain completion (no tools)
+        return await execute_memory_flush(
+            ctx.session, ctx.provider, ctx.workspace_dir
+        )
+
+
+def _load_recovery_checkpoint(ctx: AgentContext) -> None:
+    """Load .context-checkpoint.md after compaction for context recovery."""
+    if not ctx.workspace_dir:
+        return
+    checkpoint_path = Path(ctx.workspace_dir) / ".context-checkpoint.md"
+    if not checkpoint_path.exists():
+        return
+    try:
+        ctx.recovery_checkpoint = checkpoint_path.read_text(
+            encoding="utf-8", errors="replace"
+        )[:2000]
+    except Exception:
+        pass
 
 
 async def run(
@@ -118,10 +209,7 @@ async def run(
 
     # Check for memory flush before potential compaction
     if await should_flush(ctx.session, ctx.config.compaction, ctx.config.context.max_tokens):
-        flush_result = await execute_memory_flush(
-            ctx.session, ctx.provider, ctx.workspace_dir
-        )
-        # Memory flush is silent — don't show to user
+        await _run_flush_with_tools(ctx, model)
 
     # Sanitize user input
     clean_input = sanitize_text(user_input)
@@ -130,6 +218,46 @@ async def run(
     user_blocks: list[ContentBlock] = [TextBlock(text=clean_input)]
     user_msg = AgentMessage(role="user", content=user_blocks)
     ctx.session.append(user_msg)
+
+    # Auto-recall: scope-aware memory search (long-term / episodic / session)
+    if ctx.memory_searcher and len(clean_input) >= 10:
+        try:
+            recalls = await ctx.memory_searcher.search(
+                clean_input[:500], max_results=5
+            )
+            if recalls:
+                long_term: list[str] = []  # MEMORY.md
+                episodic: list[str] = []   # daily notes
+                for r in recalls:
+                    if r.final_score < 0.3:
+                        continue
+                    path = r.chunk.file_path
+                    # Session chunks are already in context — skip
+                    if r.chunk.source_type == "session":
+                        continue
+                    snippet = r.chunk.text[:300]
+                    if "MEMORY.md" in path:
+                        # Boost long-term memories
+                        score = min(r.final_score * 1.2, 1.0)
+                        long_term.append(f"[{score:.2f}] {snippet}")
+                    else:
+                        episodic.append(
+                            f"[{r.final_score:.2f}] {path}: {snippet}"
+                        )
+
+                recall_sections: list[str] = []
+                if long_term:
+                    recall_sections.append(
+                        "## Long-term Memory\n" + "\n\n".join(long_term[:2])
+                    )
+                if episodic:
+                    recall_sections.append(
+                        "## Recent Context\n" + "\n\n".join(episodic[:2])
+                    )
+                if recall_sections:
+                    ctx.auto_recall_context = "\n\n".join(recall_sections)
+        except Exception:
+            pass
 
     # Fire pre_message hook
     if ctx.hook_runner:
@@ -178,29 +306,44 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
         estimated_tokens = ctx.session.estimate_tokens()
         status = ctx.context_guard.check(estimated_tokens)
 
+        # Auto-adjust config at high utilization thresholds
+        if status.utilization >= 0.70:
+            from openclaw.context.diagnosis import diagnose_context
+            diag = diagnose_context(
+                ctx.session.messages, "", max_tokens=ctx.config.context.max_tokens
+            )
+            diag.apply_adjustments(ctx.config.context)
+
         if status.action == ContextAction.COMPACT:
             entry = await compact_session(
                 ctx.session, ctx.provider, ctx.config.compaction,
                 ctx.config.context.max_tokens,
+                workspace_dir=ctx.workspace_dir,
             )
             if entry:
                 result.compacted = True
+                _load_recovery_checkpoint(ctx)
 
         if status.action == ContextAction.ERROR:
             # Overflow — force compaction and retry
             entry = await compact_session(
                 ctx.session, ctx.provider, ctx.config.compaction,
                 ctx.config.context.max_tokens,
+                workspace_dir=ctx.workspace_dir,
             )
             if entry:
                 result.compacted = True
+                _load_recovery_checkpoint(ctx)
             else:
                 result.error = "Context overflow: unable to compact"
                 break
 
-        # Apply pruning (in-memory only)
+        # Apply pruning (in-memory only) — only prune large-output tools
+        _PRUNABLE_TOOLS = {"bash", "read", "web_fetch", "pdf", "hancom", "process", "image"}
         pruned_messages = prune_messages(
-            ctx.session.messages, ctx.config.pruning, ctx.pruning_state
+            ctx.session.messages, ctx.config.pruning, ctx.pruning_state,
+            context_window_tokens=ctx.config.context.max_tokens,
+            prunable_tools=_PRUNABLE_TOOLS,
         )
 
         # Strip already-processed images from older turns
@@ -217,6 +360,18 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
             workspace_dir=ctx.workspace_dir,
             compaction_summary=ctx.session.latest_compaction_summary,
         )
+
+        # Inject auto-recalled memories
+        if ctx.auto_recall_context:
+            system_prompt += f"\n\n{ctx.auto_recall_context}"
+
+        # Inject recovery checkpoint after compaction
+        if ctx.recovery_checkpoint:
+            system_prompt += (
+                "\n\n## Recovery Checkpoint (post-compaction)\n"
+                "The following is the last working state before compaction:\n\n"
+                f"{ctx.recovery_checkpoint}"
+            )
 
         # Stream model response
         accumulated_text = ""

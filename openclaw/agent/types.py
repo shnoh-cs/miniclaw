@@ -171,6 +171,20 @@ class ThinkingLevel(str, Enum):
         except ValueError:
             return cls.OFF
 
+    def to_api_param(self) -> dict[str, Any] | None:
+        """Return Anthropic API-style thinking parameter dict, or None if OFF."""
+        budget_map = {
+            ThinkingLevel.MINIMAL: 1024,
+            ThinkingLevel.LOW: 2048,
+            ThinkingLevel.MEDIUM: 4096,
+            ThinkingLevel.HIGH: 8192,
+            ThinkingLevel.XHIGH: 16384,
+        }
+        budget = budget_map.get(self)
+        if budget is None:
+            return None
+        return {"type": "enabled", "budget_tokens": budget}
+
     def fallback(self) -> ThinkingLevel:
         """Return the next lower thinking level."""
         order = [

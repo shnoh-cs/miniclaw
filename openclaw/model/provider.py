@@ -101,6 +101,13 @@ class ModelProvider:
             kwargs["tools"] = [t.to_openai_schema() for t in tools]
             kwargs["tool_choice"] = "auto"
 
+        # Thinking support: pass budget to Anthropic-compatible providers
+        if thinking != ThinkingLevel.OFF:
+            thinking_config = thinking.to_api_param()
+            if thinking_config:
+                kwargs.setdefault("extra_body", {})
+                kwargs["extra_body"]["thinking"] = thinking_config
+
         if opts.stop_sequences:
             kwargs["stop"] = opts.stop_sequences
         elif not use_native and tools:

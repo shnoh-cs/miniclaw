@@ -189,6 +189,72 @@ async def heartbeat_model_ping(provider: Any, model: str) -> None:
         raise
 
 
+async def heartbeat_from_file(
+    heartbeat_path: str,
+    provider: Any,
+    model: str,
+    workspace_dir: str,
+    *,
+    agent: Any | None = None,
+) -> None:
+    """Execute heartbeat instructions from a HEARTBEAT.md file.
+
+    If an Agent instance is provided, the heartbeat runs through the full
+    agent loop so that tool calls (bash, web_fetch, etc.) can actually execute.
+    Otherwise, falls back to a plain completion (no tool execution).
+    """
+    from pathlib import Path
+
+    hb_file = Path(heartbeat_path)
+    if not hb_file.exists():
+        return
+
+    content = hb_file.read_text(encoding="utf-8", errors="replace").strip()
+    if not content:
+        return
+
+    prompt = (
+        "You are running a scheduled heartbeat check. "
+        "Review the instructions below and perform any due actions. "
+        "If no actions are due right now, respond with NO_REPLY.\n\n"
+        f"Current heartbeat instructions:\n\n{content}"
+    )
+
+    # Prefer full agent loop (tools available)
+    if agent is not None:
+        try:
+            result = await agent.run(
+                prompt,
+                session_id=f"heartbeat-{int(time.time())}",
+            )
+            text = result.text or ""
+            if text.strip().upper() != "NO_REPLY":
+                logger.info("Heartbeat action: %s", text[:200])
+            return
+        except Exception as exc:
+            logger.warning("Heartbeat agent loop failed, falling back: %s", exc)
+
+    # Fallback: plain completion (no tool execution)
+    try:
+        response = await provider.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a personal assistant running a scheduled heartbeat check. "
+                    "Review the heartbeat instructions below and perform any due actions. "
+                    "If no actions are due right now, respond with NO_REPLY."
+                )},
+                {"role": "user", "content": f"Current heartbeat instructions:\n\n{content}"},
+            ],
+            max_tokens=2048,
+        )
+        result_text = response.choices[0].message.content or ""
+        if result_text.strip().upper() != "NO_REPLY":
+            logger.info("Heartbeat action (no tools): %s", result_text[:200])
+    except Exception as exc:
+        logger.warning("Heartbeat file execution failed: %s", exc)
+
+
 async def heartbeat_memory_check(memory_dir: str) -> None:
     """Check memory store health (DB accessible, index intact)."""
     from pathlib import Path

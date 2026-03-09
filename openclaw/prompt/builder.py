@@ -34,7 +34,9 @@ _CORE_TOOL_SUMMARIES: dict[str, str] = {
     "image": "Analyze an image with the configured vision model",
     "memory_search": "Search memory store for relevant context",
     "memory_save": "Save information to persistent memory",
+    "memory_get": "Read specific lines from a memory file",
     "subagent": "Spawn an isolated sub-agent for parallel subtasks",
+    "subagent_batch": "Spawn multiple sub-agents in parallel",
 }
 
 # 도구 표시 순서
@@ -42,8 +44,8 @@ _TOOL_ORDER = [
     "read", "write", "edit", "apply_patch",
     "bash", "process",
     "web_fetch", "pdf", "hancom", "image",
-    "memory_search", "memory_save",
-    "subagent",
+    "memory_search", "memory_save", "memory_get",
+    "subagent", "subagent_batch",
 ]
 
 

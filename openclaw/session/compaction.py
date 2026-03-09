@@ -484,11 +484,51 @@ def _audit_summary_quality(
 # Main compaction flow
 # ---------------------------------------------------------------------------
 
+def _write_checkpoint(messages: list[AgentMessage], workspace_dir: str) -> None:
+    """Write a context checkpoint before compaction for recovery."""
+    import datetime
+    from pathlib import Path
+
+    checkpoint_path = Path(workspace_dir) / ".context-checkpoint.md"
+    now = datetime.datetime.now().isoformat()
+
+    last_user_ask = ""
+    for msg in reversed(messages):
+        if msg.role == "user" and msg.text.strip():
+            last_user_ask = msg.text.strip()[:500]
+            break
+
+    last_assistant = ""
+    for msg in reversed(messages):
+        if msg.role == "assistant" and msg.text.strip():
+            last_assistant = msg.text.strip()[:500]
+            break
+
+    content = f"""# Context Checkpoint — {now}
+
+## Last User Request
+{last_user_ask or "(none)"}
+
+## Last Assistant Response
+{last_assistant or "(none)"}
+
+## Session Stats
+- Total messages: {len(messages)}
+- Compaction triggered at: {now}
+"""
+
+    try:
+        checkpoint_path.write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
+
 async def compact_session(
     session: SessionManager,
     provider: ModelProvider,
     config: CompactionConfig,
     context_max_tokens: int,
+    workspace_dir: str = "",
 ) -> CompactionEntry | None:
     """Perform multi-stage compaction on the session.
 
@@ -499,6 +539,10 @@ async def compact_session(
     5. Replace old messages with summary
     """
     messages = session.messages
+
+    # Write checkpoint before compaction
+    if workspace_dir:
+        _write_checkpoint(messages, workspace_dir)
     if len(messages) < 4:
         return None  # not enough to compact
 

@@ -2,7 +2,7 @@
 
 from openclaw.agent.types import AgentMessage, ContentBlock, RunResult, ToolResult
 from openclaw.config import AppConfig, load_config
-from openclaw.repl import Agent
+from openclaw.agent.api import Agent
 
 __all__ = [
     "Agent",
