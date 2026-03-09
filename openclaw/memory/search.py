@@ -373,7 +373,7 @@ def _tokenize_query(text: str) -> list[str]:
     tokens: list[str] = []
     normalized = text.lower().strip()
     # Split into segments on whitespace and punctuation
-    segments = re.split(r"[\s\p{P}]+", normalized, flags=re.UNICODE)
+    segments = re.split(r"[\s\.,;:!?\-\(\)\[\]{}<>\"'`~@#$%^&*_+=|/\\]+", normalized)
 
     for segment in segments:
         if not segment:

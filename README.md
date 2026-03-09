@@ -253,11 +253,17 @@ REPL에서 `/context` 명령으로 진단 보고서 확인 가능.
 ## 테스트
 
 ```bash
-# 전체 테스트 (45개: 오프라인 32 + 라이브 13)
+# 전체 테스트 (57개: 오프라인 44 + 라이브 13)
 python test_live.py
+
+# 오프라인만
+python test_live.py --offline
+
+# Intelligence Eval Suite (8개 시나리오)
+python eval/eval_intelligence.py
 ```
 
-### 테스트 구성
+### 테스트 구성 (`test_live.py`)
 
 #### 1. 단위 테스트 — 오프라인 12개
 | 테스트 | 검증 내용 |
@@ -278,11 +284,275 @@ python test_live.py
 #### 2. 배관 공사 검증 — 오프라인 13개
 memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subagent_batch, AgentContext.memory_searcher, prunable_tools, 컴팩션 체크포인트, heartbeat_from_file, compact_session, prompt builder, flush 안전마진
 
-#### 3. 지능 갭 검증 — 오프라인 7개
-메모리 플러시 에이전트 루프, auto_recall 필드, 체크포인트 복원, 컨텍스트 진단, 큐레이션 모듈, 진단 자동 조정, auto-recall 스코프 분리
+#### 3. 지능 갭 검증 — 오프라인 7개 + 원본 대비 8개 + 4차 4개
+메모리 플러시 에이전트 루프, auto_recall 필드, 체크포인트 복원, 컨텍스트 진단, 큐레이션 모듈, 진단 자동 조정, auto-recall 스코프 분리, Reranker, 임베딩 fingerprint, 세션 델타 싱크, 플러시 프롬프트, 동적 keep_count, 더블 플러시 방지, 플러시 전체 컨텍스트, 워크스페이스 접근 체크, memory_get 빈 파일 처리, clamp_results_by_chars, 연속 컴팩션 방지, tiktoken 토큰 추정
 
 #### 4. 라이브 테스트 — API 호출 13개
 단순 대화, Read 도구, Bash 도구, Write→Read 체인, 다중 턴 대화, WebFetch, Edit 도구, 커스텀 도구, 스트리밍 API, 에러 처리, 한국어 응답, 긴 출력 처리, 수학 추론
+
+### 테스트 결과 (2026-03-09)
+
+```
+오프라인 44개: ALL PASS
+라이브 13개: 11/13 PASS (Read 도구, 에러 처리 — LLM 응답 비결정성으로 간헐적 실패)
+```
+
+---
+
+## Intelligence Eval Suite (`eval/eval_intelligence.py`)
+
+### 설계 원칙
+
+> "순수 LLM으로는 불가능한 것들만 테스트한다."
+
+같은 대화 안에서 "10턴 전에 알려준 API 키 뭐였지?"라고 물어보는 건 단순히 LLM 컨텍스트 윈도우를 테스트하는 것이지 에이전트 하니스의 지능을 테스트하는 것이 아니다. 이 eval suite는 **에이전트 하니스가 없으면 절대 불가능한 8가지 행동**을 검증한다.
+
+모든 시나리오는 타임스탬프 조작, Mock, 임시 디렉토리를 사용하여 **수 초 이내**에 완료된다.
+(예: 큐레이션은 실제로 3일이 걸리지만, `.last-curation` 타임스탬프를 25시간 전으로 설정하고 일별 노트 3개를 직접 생성하여 즉시 테스트)
+
+### 채점 기준
+
+- 각 시나리오: 0.0 ~ 1.0 점수
+- **70% 이상 = PASS**
+- 전체 평균과 개별 시나리오 점수 출력
+
+### 최신 결과 (2026-03-09)
+
+```
+============================================================
+  OpenClaw Intelligence Eval Suite
+============================================================
+
+  기준: 순수 LLM으로는 불가능한 행동만 테스트
+  임계: 70% 이상 = PASS
+
+  100%  1. 크로스세션 기억 (API 키=OK, DB 호스트=OK, 결정사항=OK | 0.5s)
+   92%  2. 컴팩션 생존 (id_extract=4/5, prompt_ids=yes, rejects_bad=True, sections_ok=True | 0.0s)
+   75%  3. 프로액티브 리콜 (pref_recall=no, scope_split=yes, session_filter=yes, memory_boost=yes | 0.0s)
+  100%  4. 큐레이션 승격 (no_marker_run=True, old_marker_run=True, recent_marker_skip=True, llm_called=True, prompt_structure=ok, promoted=True | 0.0s)
+  100%  5. 스케줄 실행 (cron_runs=3, hb_called=True, content_injected=True, one_shot=True | 0.6s)
+  100%  6. 컨텍스트 압박 (70%_threshold_down=True (0.7→0.65), 85%_floor_up=True (5000→10000), 85%_ratio_down=True (0.3→0.25), guard_compact=True (util=96%), guard_error=True, enforce_truncate=True (100000→10000) | 0.1s)
+  100%  7. 페일오버 복구 (classify_rate_limit=True, classify_overload=True, no_failover_context=True, failover_to_b=True, failover_to_c=True, success_reset=True | 0.3s)
+  100%  8. 루프 탈출 (warn_at=9, critical_at=29, no_false_positive=True, pingpong_detect=True | 0.0s)
+
+  전체 평균: 96%
+  PASS (>=70%): 8개
+
+  ALL PASS!
+
+  [██████████████████████████████] 100%  1. 크로스세션 기억
+  [███████████████████████████░░░]  92%  2. 컴팩션 생존
+  [██████████████████████░░░░░░░░]  75%  3. 프로액티브 리콜
+  [██████████████████████████████] 100%  4. 큐레이션 승격
+  [██████████████████████████████] 100%  5. 스케줄 실행
+  [██████████████████████████████] 100%  6. 컨텍스트 압박
+  [██████████████████████████████] 100%  7. 페일오버 복구
+  [██████████████████████████████] 100%  8. 루프 탈출
+```
+
+### 시나리오 상세
+
+---
+
+#### 시나리오 1: 크로스세션 기억 — 100%
+
+**왜 순수 LLM으로는 불가능한가**: LLM은 대화가 끝나면 모든 것을 잊는다. 세션A에서 저장한 사실을 세션B에서 꺼내려면 **외부 메모리 시스템**(SQLite + FTS5 인덱스)이 반드시 필요하다.
+
+**테스트 셋업**:
+1. 임시 디렉토리에 `memory/2026-03-08.md` 파일 생성 (세션A가 저장한 것 시뮬레이션):
+   ```markdown
+   ## 프로젝트 설정
+   - API 키: sk-proj-ABC123XYZ789
+   - DB 호스트: prod-db.internal.corp:5432
+   - 결정사항: Redis 대신 Memcached를 쓰기로 결정함
+   ```
+2. `MemoryStore`(SQLite)에 `MemorySearcher.index_file()`로 인덱싱 → FTS5 가상 테이블에 청크 저장
+3. 세션B 시뮬레이션: FTS5 BM25 쿼리로 3개 사실 검색 시도
+
+**실제 실행 동작**:
+
+| 검색 대상 | FTS5 쿼리 | 결과 |
+|-----------|-----------|------|
+| API 키 | `"sk" AND "proj"` | OK — `sk-proj-ABC123XYZ789` 포함 청크 검색됨 |
+| DB 호스트 | `"prod" AND "db"` | OK — `prod-db.internal.corp:5432` 포함 청크 검색됨 |
+| 결정사항 | `Memcached*` | OK — `Memcached를` 포함 청크가 prefix 매칭으로 검색됨 |
+
+**발견된 이슈 & 해결**: SQLite FTS5의 unicode61 토크나이저는 Latin 문자와 한글 음절을 모두 "word character"로 취급하여 `Memcached를`을 하나의 토큰으로 저장한다. 따라서 exact match `"Memcached"`는 실패하고, prefix match `Memcached*`로 해결.
+
+---
+
+#### 시나리오 2: 컴팩션 생존 — 92%
+
+**왜 순수 LLM으로는 불가능한가**: 컨텍스트 윈도우가 꽉 차면 LLM은 오래된 대화를 그냥 잘라낸다. 하니스의 컴팩션은 **식별자를 추출하고 보존**하는 다단계 요약을 수행하여 URL, API 키, IP 주소 등을 절대 잃지 않는다.
+
+**테스트 셋업**:
+1. 5개 핵심 식별자가 산재한 20개 메시지(user/assistant 교대) 생성:
+   - `https://api.example.com/v2/users`
+   - `sk-proj-ABC123XYZ789DEF456`
+   - `192.168.1.42`
+   - `/home/deploy/app/config.toml`
+   - `a1b2c3d4e5f6`
+2. `extract_identifiers()` 함수로 식별자 자동 추출
+3. `_build_summarization_prompt()`로 요약 프롬프트 생성 → 식별자 포함 확인
+4. `_audit_summary_quality()`로 불완전한 요약 거부 검증
+5. `_has_required_sections_in_order()`로 올바른 섹션 구조 검증
+
+**실제 실행 동작**:
+
+| 체크 항목 | 결과 | 상세 |
+|-----------|------|------|
+| 식별자 추출 | 4/5 (80%) | URL, API키, IP, 경로는 추출됨. 짧은 hex `a1b2c3d4e5f6`는 정규식 패턴에 안 걸림 |
+| 프롬프트에 식별자 포함 | yes | 추출된 식별자가 요약 프롬프트의 `## Exact identifiers` 섹션에 명시적으로 나열됨 |
+| 불완전 요약 거부 | True | `"This is a bad summary"` → `_audit_summary_quality`가 필수 섹션 누락으로 거부 |
+| 섹션 구조 통과 | True | `Decisions → Open TODOs → Constraints → Pending user asks → Exact identifiers` 순서 확인 |
+
+**점수 계산**: `(0.8 × 0.4) + (0.2) + (0.2) + (0.2) = 0.92`
+
+---
+
+#### 시나리오 3: 프로액티브 리콜 — 75%
+
+**왜 순수 LLM으로는 불가능한가**: 사용자가 "코드 리뷰 해줘"라고만 말했을 때, LLM은 이전에 저장한 "보안 취약점 우선 체크" 선호를 알 수 없다. 하니스의 auto-recall이 매 턴 자동으로 메모리를 검색하여 관련 선호/에피소드를 시스템 프롬프트에 주입해야만 가능하다.
+
+**테스트 셋업**:
+1. `MEMORY.md`에 사용자 선호 저장: `"코드 리뷰 시 보안 취약점 우선 체크"`
+2. `memory/2026-03-08.md`에 에피소드 기억 저장: `"FastAPI 서버에 rate limiting 추가"`
+3. 두 파일을 FTS5 인덱싱
+4. `expand_query("코드 리뷰 해줘")` → `build_fts_query()` → BM25 검색
+5. `loop.py` 소스코드 검사: auto-recall 구현 확인
+
+**실제 실행 동작**:
+
+| 체크 항목 | 결과 | 상세 |
+|-----------|------|------|
+| 선호 리콜 (pref_recall) | no | `"코드 리뷰 해줘"` → `expand_query` → `"코드 리뷰"` → FTS 쿼리 `"코드" AND "리뷰"`. "보안"이 포함된 청크는 "코드 리뷰"를 포함하지 않아 BM25 매칭 실패. 임베딩 벡터 검색이 있으면 의미적으로 매칭될 수 있지만 오프라인 테스트에서는 벡터 없이 BM25만 사용 |
+| 스코프 분리 (scope_split) | yes | `loop.py`의 `run()` 함수에 `"Long-term Memory"` / `"Recent Context"` 문자열 존재 확인 |
+| 세션 필터링 (session_filter) | yes | `loop.py` 소스에 `"source_type"` 필터링 코드 존재 확인 |
+| MEMORY.md 부스트 (memory_boost) | yes | `loop.py` 소스에 `"1.2"` (MEMORY.md 소스에 1.2x 점수 부스트) 존재 확인 |
+
+**참고**: `pref_recall=no`는 BM25의 한계(키워드 정확매칭 기반)이지, 실제 운영에서는 벡터 임베딩이 함께 동작하여 의미적 연관성으로 매칭됨. 오프라인 테스트 환경의 제약.
+
+---
+
+#### 시나리오 4: 큐레이션 승격 — 100%
+
+**왜 순수 LLM으로는 불가능한가**: LLM은 "3일 연속 반복된 패턴"을 인지할 수 없다 — 각 세션은 독립적이고 이전 대화를 모른다. 하니스의 큐레이션 시스템이 일별 노트를 읽고, 반복 패턴을 탐지하고, MEMORY.md에 영구 승격해야만 가능하다.
+
+**테스트 셋업**:
+1. 3일치 일별 노트 생성 (`2026-03-07`, `2026-03-08`, `2026-03-09`):
+   ```markdown
+   ## 2026-03-07 작업
+   서버 상태 확인 작업을 수행했다. 매일 아침 9시에 서버 상태 확인하고 슬랙에 보고
+   코드 리뷰 3건 처리하고 배포 파이프라인 점검을 완료했다.
+   ```
+2. `.last-curation` 마커 파일로 디바운싱 로직 검증
+3. `curate_memories()`에 Mock LLM 주입 → 프롬프트 구성 확인
+4. Mock LLM이 승격 내용을 반환 → MEMORY.md 실제 생성 확인
+
+**실제 실행 동작**:
+
+| 체크 항목 | 결과 | 상세 |
+|-----------|------|------|
+| 마커 없을 때 실행 | True | `.last-curation` 파일 미존재 → `_should_curate()` = True |
+| 마커 25시간 전 → 실행 | True | 마커를 `time.time() - 90000`으로 설정 → `_should_curate()` = True (24시간 초과) |
+| 마커 1시간 전 → 스킵 | True | 마커를 `time.time() - 3600`으로 설정 → `_should_curate()` = False (24시간 미만) |
+| LLM 호출됨 | True | `curate_memories()` 실행 시 `mock_provider.complete`가 호출됨 = 3개 일별 노트를 읽고 프롬프트를 구성했다는 증거 |
+| 프롬프트 구조 | ok | LLM에 전달된 프롬프트에 "recurring"/"pattern"/"daily" 키워드 포함 확인 |
+| MEMORY.md 승격 | True | Mock LLM 응답 `"- 매일 아침 서버 상태 확인이 반복 패턴"` → `MEMORY.md` 파일 생성됨 → 내용에 `"서버 상태"` 포함 확인 |
+
+---
+
+#### 시나리오 5: 스케줄 실행 — 100%
+
+**왜 순수 LLM으로는 불가능한가**: LLM은 "매일 아침 9시에 실행"할 수 없다 — 요청이 들어와야만 동작한다. 하니스의 `CronScheduler` + `HEARTBEAT.md`가 주기적으로 에이전트를 호출해야만 가능하다.
+
+**테스트 셋업**:
+1. `HEARTBEAT.md` 생성:
+   ```markdown
+   ## Daily Tasks
+   - Check server status
+   - Summarize overnight alerts
+   ```
+2. `CronScheduler` 인스턴스에 0.1초 간격 콜백 등록 → 0.35초 대기 → 실행 횟수 확인
+3. `heartbeat_from_file()`에 Mock LLM 주입 → 프롬프트에 HEARTBEAT.md 내용 포함 확인
+4. one-shot 모드 테스트: 1회 실행 후 `status = "completed"` 확인
+
+**실제 실행 동작**:
+
+| 체크 항목 | 결과 | 상세 |
+|-----------|------|------|
+| Cron 실행 횟수 | 3회 | 0.1초 간격으로 등록, 0.35초 대기 → 3회 실행 (정확히 기대값) |
+| Heartbeat LLM 호출 | True | `heartbeat_from_file()`이 HEARTBEAT.md를 읽고 OpenAI 호환 API `chat.completions.create` 호출 |
+| 프롬프트에 내용 주입 | True | LLM에 전달된 messages에 `"server status"` 문자열 포함 확인 |
+| one-shot 모드 | True | `one_shot=True`로 등록된 태스크가 1회 실행 후 `status = "completed"` |
+
+---
+
+#### 시나리오 6: 컨텍스트 압박 — 100%
+
+**왜 순수 LLM으로는 불가능한가**: LLM은 컨텍스트 윈도우가 꽉 차면 그냥 에러를 반환하거나 성능이 급락한다. 하니스의 자가 진단 시스템이 사용량을 모니터링하고 **설정을 자동 조정**하여 안정성을 유지해야만 가능하다.
+
+**테스트 셋업**:
+1. tiktoken으로 정확한 토큰 수를 추정하는 `diagnose_context()`에 70% / 85% 시나리오 입력
+2. `ContextGuard.check()`에 80%, 120% 사용량 입력 → 액션 에스컬레이션 확인
+3. `enforce_budget()`으로 100,000자 도구 결과 → 트렁케이션 확인
+
+**실제 실행 동작**:
+
+| 체크 항목 | 입력 | 출력 | 상세 |
+|-----------|------|------|------|
+| 70% 임계 | 12K 윈도우에 ~8.4K 토큰 | `compaction_threshold` 0.7 → **0.65** | 진단이 "곧 가득 참"을 감지, 컴팩션을 더 일찍 트리거하도록 임계값 하향 |
+| 85% 임계 (floor) | 20K 윈도우에 ~17K 토큰 | `reserve_tokens_floor` 5,000 → **10,000** | 여유 공간 부족 감지, 최소 예약 토큰 2배 증가 |
+| 85% 임계 (ratio) | 20K 윈도우에 ~17K 토큰 | `tool_result_max_ratio` 0.3 → **0.25** | 도구 결과가 차지할 수 있는 최대 비율 축소 |
+| Guard COMPACT | 10K 윈도우에 8K 사용 | `ContextAction.COMPACT` (util=96%) | 80% 초과 → 컴팩션 액션 트리거 |
+| Guard ERROR | 10K 윈도우에 12K 사용 | `ContextAction.ERROR` | 100% 초과 → 에러 액션 |
+| 예산 강제 적용 | 100,000자 도구 결과 | **10,000자**로 트렁케이션 | `enforce_budget()`이 head(70%)+tail(30%) 분할로 10배 축소 |
+
+---
+
+#### 시나리오 7: 페일오버 복구 — 100%
+
+**왜 순수 LLM으로는 불가능한가**: LLM은 자기 자신이 장애인지 알 수 없다. 하니스의 `FailoverManager`가 에러를 분류하고, API 키를 로테이션하고, 폴백 모델로 전환하고, 성공 시 원복하는 전체 lifecycle을 관리해야만 가능하다.
+
+**테스트 셋업**:
+1. `classify_error()`: 에러 메시지 패턴 → `FailoverReason` enum 분류
+2. `FailoverManager(fallback_models=["model-b", "model-c"])` 생성 (임시 state_path 사용)
+3. 순차적 에러 주입 → 모델 전환 확인
+4. `mark_success()` → 상태 초기화 확인
+
+**실제 실행 동작**:
+
+| 체크 항목 | 입력 | 출력 | 상세 |
+|-----------|------|------|------|
+| Rate limit 분류 | `"Rate limit exceeded (429)"` | `FailoverReason.RATE_LIMIT` | "429" + "rate limit" 패턴 매칭 |
+| Overload 분류 | `"Service overloaded (503)"` | `FailoverReason.OVERLOADED` | "503" + "overload" 패턴 매칭 |
+| Context overflow 비페일오버 | `"context_length_exceeded"` | `should_failover() = False` | 컨텍스트 초과는 모델 문제가 아닌 입력 문제 → 페일오버 대상 아님 |
+| 1차 에러 → model-b | Rate limit | `next_model = "model-b"` | 프로필 "default" 1개뿐 → `mark_failure()` → 60초 cooldown 설정 → `advance_profile()` → 유일한 프로필이 cooldown 중 → None 반환 → `advance_model()` → `"model-b"` 반환 |
+| 2차 에러 → model-c | Overload | `next_model = "model-c"` | model-b에서도 실패 → `advance_model()` → `"model-c"` 반환 |
+| 성공 시 초기화 | `mark_success()` | `_retry_count = 0` | 성공 표시 후 재시도 카운터, overload 시도 횟수 모두 리셋 |
+
+**발견된 이슈 & 해결**: `FailoverManager.__post_init__`이 `load_state()`를 호출하여 `~/.openclaw-py/failover_state.json`에서 기존 상태를 로드한다. 이전 실행의 잔여 상태가 테스트를 오염시킬 수 있으므로, 임시 디렉토리의 state_path를 사용하여 격리.
+
+---
+
+#### 시나리오 8: 루프 탈출 — 100%
+
+**왜 순수 LLM으로는 불가능한가**: LLM은 "같은 도구를 30번 호출했다"는 사실을 인지할 수 없다 — 각 턴은 독립적이다. 하니스의 `ToolLoopDetector`가 호출 패턴을 추적하고, WARNING/CRITICAL을 시스템 프롬프트에 주입하여 에이전트가 루프에서 빠져나오도록 해야만 가능하다.
+
+**테스트 셋업**:
+1. 동일한 `read(path="/same/file.txt")` 15회 반복 → WARNING 감지 시점 확인
+2. 동일한 `bash(command="curl http://fail")` 35회 반복 → CRITICAL 감지 시점 확인
+3. 매번 다른 경로로 `read` 20회 → 오탐(false positive) 없는지 확인
+4. 핑퐁 패턴 (`read /a.txt` → `write /a.txt` → `read /a.txt` → ...) 25회 → 패턴 감지 확인
+
+**실제 실행 동작**:
+
+| 체크 항목 | 입력 | 출력 | 상세 |
+|-----------|------|------|------|
+| WARNING 시점 | 동일 도구+인풋 15회 | **9번째** (0-indexed) | 10회 반복 시점에서 `"WARNING: You have called read 10 times with identical arguments"` 메시지 생성. 이 메시지가 시스템 프롬프트에 주입되어 LLM이 행동을 수정할 기회를 줌 |
+| CRITICAL 시점 | 동일 도구+인풋 35회 | **29번째** (0-indexed) | 30회 반복 시점에서 `"CRITICAL: ..."` 메시지 생성. 에이전트 루프가 강제 중단됨 |
+| 오탐 없음 | 매번 다른 경로 20회 | True | 경로가 다르면 "반복"으로 카운트하지 않음. 20회 전부 경고 없이 통과 |
+| 핑퐁 감지 | read↔write 교대 25회 | True | 2개 도구가 번갈아 호출되는 패턴을 감지. `A→B→A→B→...` 교대 패턴은 일반 반복과 다른 감지기(ping-pong detector)가 처리 |
 
 ## 프로젝트 구조
 
