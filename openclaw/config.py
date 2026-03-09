@@ -132,10 +132,15 @@ class SkillsConfig(BaseModel):
 
 class WorkspaceConfig(BaseModel):
     dir: str = "~/.openclaw-py/workspace"
+    access: str = "rw"  # "rw" | "ro" | "none"
 
     @property
     def resolved_dir(self) -> Path:
         return Path(self.dir).expanduser()
+
+    @property
+    def writable(self) -> bool:
+        return self.access == "rw"
 
 
 class HooksConfig(BaseModel):

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from openclaw.agent.types import AgentMessage, TextBlock
 
 if TYPE_CHECKING:
-    from openclaw.config import CompactionConfig
+    from openclaw.config import CompactionConfig, WorkspaceConfig
     from openclaw.model.provider import ModelProvider
     from openclaw.session.manager import SessionManager
 
@@ -26,34 +26,62 @@ FLUSH_USER_PROMPT = (
     "If nothing important to save, reply with NO_REPLY."
 )
 
+# Tracks the compaction count at which the last flush was executed.
+# This prevents double-flushing within the same compaction cycle:
+# once a flush runs, it won't run again until a compaction actually occurs
+# and increments the count.
+_last_flush_compaction_count: dict[str, int] = {}
+
 
 async def should_flush(
     session: SessionManager,
     config: CompactionConfig,
     context_max_tokens: int,
+    workspace_access: str = "rw",
 ) -> bool:
     """Check if memory flush should be triggered.
 
-    Two-tier check:
+    Guards:
+    - workspace_access must be "rw" (skip for "ro" or "none")
+    - Only flush once per compaction cycle (tracked by compaction count)
+
+    Two-tier token check:
     1. Soft threshold: tokens within soft_threshold of compaction point
     2. Safety margin: tokens >= 85% of context window (catches rapid growth)
     """
     if not config.memory_flush.enabled:
         return False
 
+    # Skip flush in read-only or sandboxed workspaces
+    if workspace_access != "rw":
+        return False
+
     current_tokens = session.estimate_tokens()
 
     # Primary: soft threshold near compaction point
     compaction_point = context_max_tokens - config.memory_flush.soft_threshold_tokens
-    if current_tokens >= compaction_point:
-        return True
+    in_threshold = current_tokens >= compaction_point
 
     # Safety margin: 85% of context window (catch rapid token growth)
     safety_threshold = int(context_max_tokens * 0.85)
-    if current_tokens >= safety_threshold:
-        return True
+    in_safety = current_tokens >= safety_threshold
 
-    return False
+    if not (in_threshold or in_safety):
+        return False
+
+    # Double-flush guard: only flush once per compaction cycle
+    session_key = session.session_id
+    current_compaction_count = len(session.compaction_entries)
+    last_flushed = _last_flush_compaction_count.get(session_key, -1)
+    if last_flushed >= current_compaction_count:
+        return False  # already flushed in this cycle
+
+    return True
+
+
+def mark_flushed(session: SessionManager) -> None:
+    """Mark that a flush was executed for the current compaction cycle."""
+    _last_flush_compaction_count[session.session_id] = len(session.compaction_entries)
 
 
 async def execute_memory_flush(

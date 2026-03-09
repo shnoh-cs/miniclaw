@@ -582,7 +582,7 @@ async def test_wiring_prompt_builder_memory_get(agent) -> tuple[bool, str]:
 async def test_wiring_flush_safety_margin(agent) -> tuple[bool, str]:
     """#14: should_flush()가 85% 안전 마진을 적용하는지."""
     from unittest.mock import MagicMock
-    from openclaw.session.memory_flush import should_flush
+    from openclaw.session.memory_flush import should_flush, _last_flush_compaction_count
     from openclaw.config import CompactionConfig
 
     config = CompactionConfig(memory_flush={"enabled": True, "soft_threshold_tokens": 4000})
@@ -590,10 +590,17 @@ async def test_wiring_flush_safety_margin(agent) -> tuple[bool, str]:
     # 세션 모킹: 85% of 32768 = 27852 토큰
     session = MagicMock()
     session.estimate_tokens.return_value = 28000  # > 85%
+    session.session_id = "test-safety-margin"
+    session.compaction_entries = []
+
+    # 더블 플러시 카운터 초기화
+    _last_flush_compaction_count.pop("test-safety-margin", None)
 
     # soft threshold 기준으론 미달 (32768-4000=28768), 하지만 85% 마진으로 트리거
     result = await should_flush(session, config, context_max_tokens=32768)
     ok = result is True
+
+    _last_flush_compaction_count.pop("test-safety-margin", None)
     return ok, f"28K/32K 토큰에서 flush 트리거: {result}"
 
 
@@ -868,6 +875,94 @@ async def test_dynamic_keep_count(agent) -> tuple[bool, str]:
     return ok, f"func={ok1}, param={ok2}, dynamic={ok3} (small={small_keep}, large={large_keep})"
 
 
+async def test_double_flush_guard(agent) -> tuple[bool, str]:
+    """컴팩션 사이클당 한 번만 플러시되는지 (더블 플러시 방지)."""
+    from openclaw.session.memory_flush import should_flush, mark_flushed, _last_flush_compaction_count
+    from openclaw.session.manager import SessionManager
+    from openclaw.config import CompactionConfig
+    from openclaw.agent.types import AgentMessage, TextBlock
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        session = SessionManager(Path(tmpdir), "test-double-flush")
+        session._loaded = True
+        # 큰 메시지로 토큰 임계값 초과
+        session.messages = [
+            AgentMessage(role="user", content=[TextBlock(text="x" * 120000)]),
+        ]
+        config = CompactionConfig()
+
+        # 플러시 카운터 초기화
+        _last_flush_compaction_count.pop("test-double-flush", None)
+
+        # 첫 번째: should_flush → True
+        ok1 = await should_flush(session, config, 32768)
+
+        # mark_flushed 후
+        mark_flushed(session)
+
+        # 두 번째: 같은 컴팩션 사이클 → False (더블 플러시 방지)
+        ok2 = not await should_flush(session, config, 32768)
+
+        # 클린업
+        _last_flush_compaction_count.pop("test-double-flush", None)
+
+    return ok1 and ok2, f"first={ok1}, blocked={ok2}"
+
+
+async def test_flush_full_context(agent) -> tuple[bool, str]:
+    """플러시가 기존 세션 컨텍스트 내에서 실행되는지 (별도 세션 아님)."""
+    from openclaw.agent import loop as loop_mod
+    import inspect
+
+    source = inspect.getsource(loop_mod._run_flush_with_tools)
+    # 기존 세션 사용: tempfile/임시 세션 생성 없음
+    ok1 = "tempfile" not in source
+    ok2 = "flush_session" not in source
+    # pre_flush_count로 메시지 복원
+    ok3 = "pre_flush_count" in source
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"no_temp={ok1}, no_flush_session={ok2}, restore={ok3}"
+
+
+async def test_workspace_access_check(agent) -> tuple[bool, str]:
+    """read-only 워크스페이스에서 플러시가 건너뛰어지는지."""
+    from openclaw.session.memory_flush import should_flush, _last_flush_compaction_count
+    from openclaw.session.manager import SessionManager
+    from openclaw.config import CompactionConfig, WorkspaceConfig
+    from openclaw.agent.types import AgentMessage, TextBlock
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        session = SessionManager(Path(tmpdir), "test-ro")
+        session._loaded = True
+        session.messages = [
+            AgentMessage(role="user", content=[TextBlock(text="x" * 120000)]),
+        ]
+        config = CompactionConfig()
+        _last_flush_compaction_count.pop("test-ro", None)
+
+        # rw → True
+        ok1 = await should_flush(session, config, 32768, workspace_access="rw")
+
+        # ro → False
+        ok2 = not await should_flush(session, config, 32768, workspace_access="ro")
+
+        # none → False
+        ok3 = not await should_flush(session, config, 32768, workspace_access="none")
+
+        # WorkspaceConfig.writable 속성 확인
+        ws_rw = WorkspaceConfig(access="rw")
+        ws_ro = WorkspaceConfig(access="ro")
+        ok4 = ws_rw.writable and not ws_ro.writable
+
+        _last_flush_compaction_count.pop("test-ro", None)
+
+    ok = ok1 and ok2 and ok3 and ok4
+    return ok, f"rw={ok1}, ro_skip={ok2}, none_skip={ok3}, config={ok4}"
+
+
 # ── 메인 ─────────────────────────────────────────────────
 
 
@@ -930,6 +1025,9 @@ async def main() -> None:
     await run_test("세션 델타 싱크", test_session_delta_sync(agent))
     await run_test("플러시 프롬프트 스타일", test_flush_prompt_style(agent))
     await run_test("동적 keep_count", test_dynamic_keep_count(agent))
+    await run_test("더블 플러시 방지", test_double_flush_guard(agent))
+    await run_test("플러시 전체 컨텍스트", test_flush_full_context(agent))
+    await run_test("워크스페이스 접근 체크", test_workspace_access_check(agent))
 
     # ── 라이브 테스트 (API 호출) ──
     header("4. 라이브 테스트 (API 호출)")

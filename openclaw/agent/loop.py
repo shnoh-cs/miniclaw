@@ -48,7 +48,7 @@ from openclaw.prompt.builder import build_system_prompt
 from openclaw.prompt.sanitize import sanitize_text
 from openclaw.session.compaction import compact_session
 from openclaw.session.manager import SessionManager, SessionWriteLock
-from openclaw.session.memory_flush import execute_memory_flush, should_flush
+from openclaw.session.memory_flush import execute_memory_flush, mark_flushed, should_flush
 from openclaw.session.pruning import PruningState, prune_messages, prune_processed_images
 from openclaw.skills.loader import build_skills_prompt, load_skills
 from openclaw.tools.registry import (
@@ -106,62 +106,55 @@ class AgentContext:
 async def _run_flush_with_tools(ctx: AgentContext, model: str) -> str | None:
     """Run memory flush through agent loop with tool access.
 
-    Unlike plain text flush, this lets the model:
-    1. Search existing memories (memory_search) to avoid duplicates
-    2. Save structured memories (memory_save) with proper formatting
+    Runs the flush turn within the existing session context so the model can
+    see the full conversation history (matching original OpenClaw behavior).
+    The flush prompt is appended as a user message; after the flush loop
+    completes, the flush messages are removed from the session to keep it clean.
+
     Falls back to plain completion on failure.
     """
-    import tempfile
-
-    # Build conversation summary for flush context
-    recent = ctx.session.messages[-20:]
-    conv_lines = []
-    for m in recent:
-        text = m.text[:500]
-        if text:
-            conv_lines.append(f"[{m.role}] {text}")
-    conv_summary = "\n".join(conv_lines)
-
     date_str = datetime.date.today().isoformat()
     flush_prompt = (
-        f"Store durable memories now. Recent conversation:\n\n"
-        f"{conv_summary}\n\n"
+        f"Store durable memories now. "
         f"Write any lasting notes (facts, decisions, user preferences) to "
         f"memory/{date_str}.md using memory_save.\n"
         f"Reply with NO_REPLY if nothing important to save."
     )
 
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            flush_session = SessionManager(Path(tmpdir), f"flush-{int(time.time())}")
-            flush_session._loaded = True
+        # Snapshot message count before flush
+        pre_flush_count = len(ctx.session.messages)
 
-            # Add flush prompt as user message
-            flush_user = AgentMessage(
-                role="user", content=[TextBlock(text=flush_prompt)]
-            )
-            flush_session.messages.append(flush_user)
+        # Append flush prompt directly into the existing session so the model
+        # sees the full conversation context (not just a summary).
+        flush_user = AgentMessage(
+            role="user", content=[TextBlock(text=flush_prompt)]
+        )
+        ctx.session.messages.append(flush_user)
 
-            flush_ctx = replace(
-                ctx,
-                session=flush_session,
-                bootstrap_ctx=None,
-                skills_prompt="",
-                loop_detector=ToolLoopDetector(),
-                pruning_state=PruningState(),
-                on_stream=None,
-                on_thinking=None,
-                on_tool_start=None,
-                on_tool_end=None,
-                auto_recall_context="",
-                recovery_checkpoint="",
-            )
+        flush_ctx = replace(
+            ctx,
+            bootstrap_ctx=None,
+            skills_prompt="",
+            loop_detector=ToolLoopDetector(),
+            pruning_state=PruningState(),
+            on_stream=None,
+            on_thinking=None,
+            on_tool_start=None,
+            on_tool_end=None,
+            auto_recall_context="",
+            recovery_checkpoint="",
+        )
 
-            result = await _attempt_loop(flush_ctx, model)
-            text = result.text or ""
-            if text.strip().upper() == NO_REPLY:
-                return None
-            return text
+        result = await _attempt_loop(flush_ctx, model)
+
+        # Remove flush messages from session to keep it clean
+        ctx.session.messages = ctx.session.messages[:pre_flush_count]
+
+        text = result.text or ""
+        if text.strip().upper() == NO_REPLY:
+            return None
+        return text
     except Exception:
         # Fallback: plain completion (no tools)
         return await execute_memory_flush(
@@ -205,8 +198,13 @@ async def run(
     ctx.session.load()
 
     # Check for memory flush before potential compaction
-    if await should_flush(ctx.session, ctx.config.compaction, ctx.config.context.max_tokens):
+    workspace_access = ctx.config.workspace.access if hasattr(ctx.config.workspace, "access") else "rw"
+    if await should_flush(
+        ctx.session, ctx.config.compaction, ctx.config.context.max_tokens,
+        workspace_access=workspace_access,
+    ):
         await _run_flush_with_tools(ctx, model)
+        mark_flushed(ctx.session)
 
     # Sanitize user input
     clean_input = sanitize_text(user_input)
