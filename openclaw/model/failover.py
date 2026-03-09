@@ -26,6 +26,7 @@ from openclaw.model.cooldown import (  # noqa: F401
     ApiKeyRotator,
     ProfileCooldown,
     overload_delay_seconds,
+    rate_limit_delay_seconds,
 )
 
 log = logging.getLogger("openclaw.failover")
@@ -124,14 +125,19 @@ class FailoverManager:
             return None
         return self.fallback_models[self._current_model_idx]
 
-    def _maybe_pace_overload(self, reason: FailoverReason) -> None:
-        """Brief sleep during overload to avoid tight retry bursts."""
-        if reason != FailoverReason.OVERLOADED:
+    def _maybe_pace_retry(self, reason: FailoverReason) -> None:
+        """Brief sleep during overload/rate-limit to avoid tight retry bursts."""
+        if reason == FailoverReason.RATE_LIMIT:
+            delay = rate_limit_delay_seconds(self._overload_failover_attempts)
+            self._overload_failover_attempts += 1
+            log.debug("Rate-limit backoff: %.1fs (attempt %d)", delay, self._overload_failover_attempts)
+            time.sleep(delay)
+        elif reason == FailoverReason.OVERLOADED:
+            delay = overload_delay_seconds(self._overload_failover_attempts)
+            self._overload_failover_attempts += 1
+            time.sleep(delay)
+        else:
             self._overload_failover_attempts = 0
-            return
-        delay = overload_delay_seconds(self._overload_failover_attempts)
-        self._overload_failover_attempts += 1
-        time.sleep(delay)
 
     def handle_error(self, error: str | Exception) -> tuple[FailoverReason, str | None]:
         """Handle an error: classify, update cooldown, attempt failover.
@@ -156,7 +162,7 @@ class FailoverManager:
             self.save_state()
             return reason, None
 
-        self._maybe_pace_overload(reason)
+        self._maybe_pace_retry(reason)
 
         next_profile = self.advance_profile()
         if next_profile:

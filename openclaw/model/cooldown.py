@@ -132,6 +132,11 @@ _OVERLOAD_FACTOR = 2
 _OVERLOAD_MAX_MS = 1500
 _OVERLOAD_JITTER = 0.2
 
+_RATE_LIMIT_INITIAL_MS = 1000
+_RATE_LIMIT_FACTOR = 2
+_RATE_LIMIT_MAX_MS = 30_000
+_RATE_LIMIT_JITTER = 0.2
+
 
 def overload_delay_seconds(attempt: int) -> float:
     """Compute the overload pacing delay for a given attempt number (0-based).
@@ -142,4 +147,16 @@ def overload_delay_seconds(attempt: int) -> float:
     raw_ms = _OVERLOAD_INITIAL_MS * (_OVERLOAD_FACTOR ** attempt)
     capped_ms = min(raw_ms, _OVERLOAD_MAX_MS)
     jitter = 1.0 + (random.random() * 2 - 1) * _OVERLOAD_JITTER
+    return (capped_ms * jitter) / 1000.0
+
+
+def rate_limit_delay_seconds(attempt: int) -> float:
+    """Compute rate-limit backoff delay (0-based attempt).
+
+    Uses exponential backoff: 1s -> 2s -> 4s -> 8s -> 16s -> 30s (capped),
+    with jitter.
+    """
+    raw_ms = _RATE_LIMIT_INITIAL_MS * (_RATE_LIMIT_FACTOR ** attempt)
+    capped_ms = min(raw_ms, _RATE_LIMIT_MAX_MS)
+    jitter = 1.0 + (random.random() * 2 - 1) * _RATE_LIMIT_JITTER
     return (capped_ms * jitter) / 1000.0

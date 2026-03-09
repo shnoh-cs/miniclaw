@@ -1107,6 +1107,7 @@ async def test_tiktoken_estimation(agent) -> tuple[bool, str]:
 async def main() -> None:
     parser = argparse.ArgumentParser(description="OpenClaw-Py 비대화형 테스트")
     parser.add_argument("--offline", action="store_true", help="오프라인 테스트만 실행 (API 호출 없음)")
+    parser.add_argument("--delay", type=float, default=0, help="라이브 테스트 사이 대기 시간 (초, 무료 모델용)")
     args = parser.parse_args()
 
     from openclaw.agent.api import Agent
@@ -1185,19 +1186,25 @@ async def main() -> None:
         header("4. 라이브 테스트 — 건너뜀 (--offline)")
     else:
         header("4. 라이브 테스트 (API 호출)")
-        await run_test("단순 대화", test_simple_chat(agent))
-        await run_test("Read 도구", test_tool_read(agent))
-        await run_test("Bash 도구", test_tool_bash(agent))
-        await run_test("Write → Read 체인", test_tool_write_and_read(agent))
-        await run_test("다중 턴 대화", test_multi_turn(agent))
-        await run_test("WebFetch 도구", test_web_fetch(agent))
-        await run_test("Edit 도구", test_edit_tool(agent))
-        await run_test("커스텀 도구", test_custom_tool(agent))
-        await run_test("스트리밍 API", test_streaming(agent))
-        await run_test("에러 처리", test_error_handling(agent))
-        await run_test("한국어 응답", test_korean_response(agent))
-        await run_test("긴 출력 처리", test_long_output(agent))
-        await run_test("수학 추론", test_math_reasoning(agent))
+        live_tests = [
+            ("단순 대화", test_simple_chat),
+            ("Read 도구", test_tool_read),
+            ("Bash 도구", test_tool_bash),
+            ("Write → Read 체인", test_tool_write_and_read),
+            ("다중 턴 대화", test_multi_turn),
+            ("WebFetch 도구", test_web_fetch),
+            ("Edit 도구", test_edit_tool),
+            ("커스텀 도구", test_custom_tool),
+            ("스트리밍 API", test_streaming),
+            ("에러 처리", test_error_handling),
+            ("한국어 응답", test_korean_response),
+            ("긴 출력 처리", test_long_output),
+            ("수학 추론", test_math_reasoning),
+        ]
+        for i, (name, test_fn) in enumerate(live_tests):
+            await run_test(name, test_fn(agent))
+            if i < len(live_tests) - 1:
+                await asyncio.sleep(args.delay)
 
     # ── 결과 요약 ──
     header("결과 요약")
