@@ -40,5 +40,5 @@ def estimate_tokens(text: str) -> int:
         try:
             return len(enc.encode(text, disallowed_special=()))
         except Exception:
-            pass
+            log.debug("tiktoken encode failed, using fallback", exc_info=True)
     return len(text) // _FALLBACK_CHARS_PER_TOKEN

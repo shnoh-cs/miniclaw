@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("openclaw.session")
 
 from openclaw.agent.types import (
     AgentMessage,
@@ -113,7 +116,7 @@ class SessionWriteLock:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
                 os.close(self._fd)
             except OSError:
-                pass
+                log.debug("Failed to release session lock", exc_info=True)
             finally:
                 self._fd = None
                 self.lock_path.unlink(missing_ok=True)
@@ -159,7 +162,7 @@ class SessionManager:
                 return  # cache hit
             self._file_mtime = stat.st_mtime
         except OSError:
-            pass
+            log.debug("Failed to stat session file %s", self.file_path, exc_info=True)
 
         with open(self.file_path, encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):

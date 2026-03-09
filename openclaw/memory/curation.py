@@ -51,7 +51,7 @@ def _mark_curated(workspace_dir: str) -> None:
     try:
         marker.write_text(str(time.time()))
     except OSError:
-        pass
+        logger.debug("Failed to write curation marker", exc_info=True)
 
 
 async def _find_recurring_themes(
@@ -188,7 +188,7 @@ async def curate_memories(
         try:
             existing = memory_md.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            pass
+            logger.debug("Failed to read MEMORY.md", exc_info=True)
 
     # Phase 1: Embedding-based candidate detection (if available)
     embedding_candidates: list[str] | None = None

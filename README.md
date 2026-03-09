@@ -799,22 +799,41 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 
 ```
 miniclaw/
-├── openclaw/               # 메인 패키지 (~10,600줄, 49 모듈)
+├── openclaw/               # 메인 패키지 (~5,700줄 코어 + ~1,300줄 builtins, 57 모듈)
 │   ├── agent/              #   Agent API·에이전트 루프·타입
 │   │   ├── api.py          #     Agent 클래스 (진입점)
 │   │   ├── loop.py         #     메인 루프
 │   │   └── types.py        #     메시지·도구·결과 타입
 │   ├── model/              #   LLM 프로바이더·페일오버·thinking
+│   │   ├── provider.py     #     OpenAI 호환 API 클라이언트
+│   │   ├── failover.py     #     FailoverManager (프로필 로테이션·상태 영속화)
+│   │   ├── error_classify.py #   에러 패턴 분류·should_failover 판정
+│   │   ├── cooldown.py     #     ProfileCooldown·ApiKeyRotator·백오프
+│   │   └── thinking.py     #     Thinking 레벨 해석·폴백
 │   ├── session/            #   세션·컴팩션·프루닝·lanes·메모리 플러시
+│   │   ├── compaction.py   #     다단계 컴팩션 (split→summarize→merge)
+│   │   ├── identifiers.py  #     식별자 추출·정규화
+│   │   ├── safeguard.py    #     컴팩션 품질 검증·도구 실패 추적
+│   │   └── ...             #     manager, pruning, lanes, memory_flush
 │   ├── context/            #   컨텍스트 가드·자가 진단
 │   ├── memory/             #   SQLite+FTS5+벡터 메모리·큐레이션
+│   │   ├── search.py       #     MemorySearcher (하이브리드 검색 오케스트레이터)
+│   │   ├── ranking.py      #     cosine·BM25·Jaccard·MMR·시간 감쇠
+│   │   ├── query.py        #     다국어 쿼리 토큰화·확장·FTS 빌더
+│   │   ├── watchers.py     #     FileWatcher·Reranker·SessionSyncWatcher
+│   │   └── ...             #     store, embeddings, curation
 │   ├── prompt/             #   시스템 프롬프트·인젝션 방어
 │   ├── tools/              #   도구 레지스트리·11개 내장 도구
+│   │   ├── registry.py     #     ToolRegistry·RegisteredTool
+│   │   ├── loop_detector.py #    4종 루프 감지 (repeat·poll·ping-pong·breaker)
+│   │   ├── truncation.py   #     도구 결과 트렁케이션·세션 가드
+│   │   └── builtins/       #     11개 내장 도구
 │   ├── skills/             #   스킬 디스커버리
 │   ├── subagent/           #   서브에이전트
 │   ├── hooks/              #   Hook 시스템
 │   ├── cron/               #   Cron/Heartbeat
 │   ├── config.py           #   TOML 설정
+│   ├── tokenizer.py        #   tiktoken 토큰 추정
 │   └── repl.py             #   대화형 REPL
 ├── eval/                   # Eval Suites
 │   ├── eval_intelligence.py  # Intelligence Eval (8개 시나리오)

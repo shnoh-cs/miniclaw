@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+log = logging.getLogger("openclaw.memory.store")
 
 
 @dataclass
@@ -117,7 +120,7 @@ class MemoryStore:
                 conn.execute("DELETE FROM fts_search WHERE rowid=?", (chunk.id,))
                 conn.execute("INSERT INTO fts_search(rowid, text) VALUES (?, ?)", (chunk.id, chunk.text))
             except sqlite3.OperationalError:
-                pass
+                log.debug("FTS update failed for chunk %d", chunk.id, exc_info=True)
             conn.commit()
             return chunk.id
 
@@ -141,7 +144,7 @@ class MemoryStore:
                 (chunk_id, chunk.text),
             )
         except sqlite3.OperationalError:
-            pass
+            log.debug("FTS insert failed for chunk %d", chunk_id, exc_info=True)
 
         conn.commit()
         return chunk_id
@@ -299,7 +302,7 @@ class MemoryStore:
         try:
             conn.execute("DELETE FROM fts_search")
         except sqlite3.OperationalError:
-            pass
+            log.debug("FTS search table reset failed", exc_info=True)
         conn.commit()
         self.set_metadata("embedding_fingerprint", new_fingerprint)
 

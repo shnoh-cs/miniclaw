@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ from openclaw.agent.types import (
     ToolParameter,
     ToolResult,
 )
+log = logging.getLogger("openclaw.api")
+
 from openclaw.config import AppConfig, load_config
 from openclaw.context.guard import ContextGuard
 from openclaw.cron import CronScheduler, heartbeat_from_file, heartbeat_memory_check, heartbeat_model_ping
@@ -473,8 +476,6 @@ class Agent:
         if not searcher:
             return
 
-        import logging
-        log = logging.getLogger("openclaw.memory")
         indexed = 0
 
         # Workspace MEMORY.md
@@ -483,7 +484,7 @@ class Agent:
             try:
                 indexed += await searcher.index_file(workspace_memory)
             except Exception:
-                pass
+                log.debug("Failed to index %s", workspace_memory, exc_info=True)
 
         # memory/ directory .md files
         memory_dir = self.config.memory.resolved_dir
@@ -492,7 +493,7 @@ class Agent:
                 try:
                     indexed += await searcher.index_file(md_file)
                 except Exception:
-                    pass
+                    log.debug("Failed to index %s", md_file, exc_info=True)
 
         if indexed > 0:
             log.info("Initial memory index: %d chunks indexed", indexed)
@@ -513,7 +514,7 @@ class Agent:
             try:
                 await searcher.index_session_jsonl(jsonl_file)
             except Exception:
-                pass
+                log.debug("Failed to index session %s", jsonl_file.stem, exc_info=True)
 
     async def run(
         self,
@@ -553,7 +554,7 @@ class Agent:
                     embedding_provider=self._embedding_provider,
                 )
         except Exception:
-            pass
+            log.debug("Memory curation failed", exc_info=True)
 
     async def stream(
         self,

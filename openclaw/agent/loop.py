@@ -14,12 +14,15 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+log = logging.getLogger("openclaw.loop")
 
 if TYPE_CHECKING:
     from openclaw.memory.search import MemorySearcher
@@ -209,7 +212,7 @@ def _load_recovery_checkpoint(ctx: AgentContext) -> None:
             encoding="utf-8", errors="replace"
         )[:2000]
     except Exception:
-        pass
+        log.debug("Failed to load recovery checkpoint", exc_info=True)
 
 
 async def run(
@@ -256,7 +259,7 @@ async def run(
             if jsonl_path.exists():
                 await ctx.memory_searcher.sync_session_if_needed(jsonl_path)
         except Exception:
-            pass
+            log.debug("Session delta sync failed", exc_info=True)
 
     # Auto-recall: scope-aware memory search (long-term / episodic / session)
     if ctx.memory_searcher and len(clean_input) >= 10:
@@ -296,7 +299,7 @@ async def run(
                 if recall_sections:
                     ctx.auto_recall_context = "\n\n".join(recall_sections)
         except Exception:
-            pass
+            log.debug("Auto-recall search failed", exc_info=True)
 
     # Fire pre_message hook
     if ctx.hook_runner:

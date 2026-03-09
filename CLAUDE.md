@@ -14,23 +14,27 @@ OpenClaw Agent Harness의 Python 포트. 원본의 모든 "지능(intelligence)"
 - 빌드: hatchling
 - 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile
 - 설정: `config.toml` (gitignore됨) / `config.example.toml` (vLLM 예시)
-- 총 소스: ~10,600줄 (49개 모듈)
+- 총 소스: ~5,700줄 코어 + ~1,300줄 builtins (57개 모듈)
 
 ## 디렉토리 구조
 
 ```
 openclaw/
 ├── agent/          # Agent API, 에이전트 루프, 타입 정의
-│   ├── api.py           585줄  Agent 클래스 (Python API 진입점)
-│   ├── loop.py          633줄  메인 루프 (run → attempt → stream → tool dispatch)
+│   ├── api.py           608줄  Agent 클래스 (Python API 진입점)
+│   ├── loop.py          685줄  메인 루프 (run → attempt → stream → tool dispatch)
 │   └── types.py         288줄  AgentMessage, ToolDefinition, RunResult 등
 ├── model/          # LLM 프로바이더, 페일오버
 │   ├── provider.py      408줄  OpenAI 호환 API 클라이언트
-│   ├── failover.py      829줄  에러 분류·페일오버·키 로테이션·상태 영속화
+│   ├── failover.py      300줄  FailoverManager (프로필 로테이션·상태 영속화)
+│   ├── error_classify.py 329줄  에러 패턴 분류·should_failover 판정
+│   ├── cooldown.py      145줄  ProfileCooldown·ApiKeyRotator·백오프
 │   └── thinking.py       62줄  Thinking 레벨 해석·폴백
 ├── session/        # 세션 관리, 컴팩션, 프루닝
-│   ├── manager.py       301줄  JSONL append-only 세션
-│   ├── compaction.py   1067줄  다단계 컴팩션 (split→summarize→merge)
+│   ├── manager.py       309줄  JSONL append-only 세션
+│   ├── compaction.py    649줄  다단계 컴팩션 (split→summarize→merge)
+│   ├── identifiers.py    73줄  식별자 추출·정규화
+│   ├── safeguard.py     326줄  컴팩션 품질 검증·도구 실패 추적
 │   ├── pruning.py       372줄  Cache-TTL 프루닝·이미지 프루닝
 │   ├── lanes.py         150줄  병렬 대화 스레드
 │   └── memory_flush.py   99줄  컴팩션 전 메모리 플러시
@@ -38,8 +42,11 @@ openclaw/
 │   ├── guard.py         268줄  토큰 예산·트렁케이션·enforce_budget
 │   └── diagnosis.py     223줄  컨텍스트 자가 진단·설정 자동 조정
 ├── memory/         # 하이브리드 메모리 시스템
-│   ├── store.py         243줄  SQLite + FTS5
-│   ├── search.py        817줄  BM25 + 벡터 + MMR + 시간 감쇠
+│   ├── store.py         312줄  SQLite + FTS5
+│   ├── search.py        350줄  MemorySearcher (하이브리드 검색 오케스트레이터)
+│   ├── ranking.py       219줄  cosine·BM25·Jaccard·MMR·시간 감쇠
+│   ├── query.py         177줄  다국어 쿼리 토큰화·확장·FTS 빌더
+│   ├── watchers.py      146줄  FileWatcher·Reranker·SessionSyncWatcher
 │   ├── embeddings.py     61줄  임베딩 프로바이더
 │   └── curation.py      281줄  일별 노트 → MEMORY.md 자동 승격
 ├── prompt/         # 시스템 프롬프트·인젝션 방어
@@ -47,7 +54,9 @@ openclaw/
 │   ├── bootstrap.py     138줄  부트스트랩 파일 8종 로딩
 │   └── sanitize.py      406줄  인젝션 방어 (13종 패턴·호모글리프·경계마커)
 ├── tools/          # 도구 레지스트리·11개 내장 도구
-│   ├── registry.py      628줄  등록·실행·루프 감지(4종)·트렁케이션
+│   ├── registry.py       88줄  ToolRegistry·RegisteredTool
+│   ├── loop_detector.py 401줄  4종 루프 감지 (repeat·poll·ping-pong·breaker)
+│   ├── truncation.py    130줄  도구 결과 트렁케이션·세션 가드
 │   └── builtins/       1290줄  Read, Write, Edit, ApplyPatch, Bash, Process,
 │                                WebFetch, PDF, Hancom, Image, Memory(3)
 ├── skills/         # 스킬 디스커버리
@@ -92,16 +101,18 @@ openclaw/
 - **Native/Prompt 듀얼 툴 콜링**: `tool_mode = auto|native|prompt`
 - 스트리밍 도구 호출: `pending_tool_calls` 청크 누적 → `finish_reason == "tool_calls"` 시 1회 생성
 
-### 다단계 컴팩션 (`session/compaction.py`)
+### 다단계 컴팩션 (`session/compaction.py` + `identifiers.py` + `safeguard.py`)
 - split→summarize→merge (adaptive chunk ratio, SAFETY_MARGIN=1.2)
 - 3단계 프로그레시브 폴백 (`summarize_with_fallback`)
 - safeguard 검증: 식별자 보존, 정렬된 섹션, ask 중복 검사
+- `_estimate_message_tokens()` 통합 헬퍼 (5개 중복 패턴 제거)
 
-### 메모리 (`memory/`)
+### 메모리 (`memory/search.py` + `ranking.py` + `query.py` + `watchers.py`)
 - SQLite + FTS5 + 벡터 임베딩 (L2 정규화)
 - 하이브리드 검색: BM25 + cosine + MMR + 시간 감쇠 (30일 반감기)
 - 다국어 쿼리 확장 (EN/KO/ZH/JA)
 - FileWatcher (30초 디바운싱), 세션 인덱싱, 캐시 임베딩
+- `_batch_embed_with_cache()` 통합 헬퍼 (중복 캐시 로직 제거)
 
 ### 컨텍스트 자가 진단 (`context/diagnosis.py`)
 - 토큰 사용량 카테고리별 분해 (시스템/도구/세션/컴팩션)
