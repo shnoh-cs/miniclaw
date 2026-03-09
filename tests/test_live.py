@@ -2,11 +2,12 @@
 """비대화형 라이브 테스트 스크립트.
 
 Agent Python API를 직접 사용하여 다양한 시나리오를 테스트한다.
-실행: source .venv/bin/activate && python test_live.py
+실행: .venv/bin/python tests/test_live.py [--offline]
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import sys
@@ -1104,6 +1105,10 @@ async def test_tiktoken_estimation(agent) -> tuple[bool, str]:
 
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="OpenClaw-Py 비대화형 테스트")
+    parser.add_argument("--offline", action="store_true", help="오프라인 테스트만 실행 (API 호출 없음)")
+    args = parser.parse_args()
+
     from openclaw.agent.api import Agent
 
     header("OpenClaw-Py 비대화형 라이브 테스트")
@@ -1112,6 +1117,8 @@ async def main() -> None:
     info(f"모델: {agent.config.models.default}")
     info(f"워크스페이스: {agent.workspace}")
     info(f"엔드포인트: {agent.config.endpoints.llm.base_url}")
+    if args.offline:
+        info("모드: 오프라인 (라이브 테스트 건너뜀)")
     print()
 
     # ── 단위 테스트 (API 호출 없음) ──
@@ -1174,20 +1181,23 @@ async def main() -> None:
     await run_test("tiktoken 토큰 추정", test_tiktoken_estimation(agent))
 
     # ── 라이브 테스트 (API 호출) ──
-    header("4. 라이브 테스트 (API 호출)")
-    await run_test("단순 대화", test_simple_chat(agent))
-    await run_test("Read 도구", test_tool_read(agent))
-    await run_test("Bash 도구", test_tool_bash(agent))
-    await run_test("Write → Read 체인", test_tool_write_and_read(agent))
-    await run_test("다중 턴 대화", test_multi_turn(agent))
-    await run_test("WebFetch 도구", test_web_fetch(agent))
-    await run_test("Edit 도구", test_edit_tool(agent))
-    await run_test("커스텀 도구", test_custom_tool(agent))
-    await run_test("스트리밍 API", test_streaming(agent))
-    await run_test("에러 처리", test_error_handling(agent))
-    await run_test("한국어 응답", test_korean_response(agent))
-    await run_test("긴 출력 처리", test_long_output(agent))
-    await run_test("수학 추론", test_math_reasoning(agent))
+    if args.offline:
+        header("4. 라이브 테스트 — 건너뜀 (--offline)")
+    else:
+        header("4. 라이브 테스트 (API 호출)")
+        await run_test("단순 대화", test_simple_chat(agent))
+        await run_test("Read 도구", test_tool_read(agent))
+        await run_test("Bash 도구", test_tool_bash(agent))
+        await run_test("Write → Read 체인", test_tool_write_and_read(agent))
+        await run_test("다중 턴 대화", test_multi_turn(agent))
+        await run_test("WebFetch 도구", test_web_fetch(agent))
+        await run_test("Edit 도구", test_edit_tool(agent))
+        await run_test("커스텀 도구", test_custom_tool(agent))
+        await run_test("스트리밍 API", test_streaming(agent))
+        await run_test("에러 처리", test_error_handling(agent))
+        await run_test("한국어 응답", test_korean_response(agent))
+        await run_test("긴 출력 처리", test_long_output(agent))
+        await run_test("수학 추론", test_math_reasoning(agent))
 
     # ── 결과 요약 ──
     header("결과 요약")

@@ -122,7 +122,7 @@ openclaw/
 
 ## 테스트
 
-### `test_live.py` — 45개 테스트
+### `tests/test_live.py` — 57개 테스트
 - 오프라인 12개: ContextGuard, ToolRegistry, SessionLanes, Cron, Hook, 인젝션 방어, ThinkingLevel, 세션 영속성, 트렁케이션, 루프 감지, ApplyPatch, Failover
 - 배관 공사 13개: memory_get, 플러시, Thinking API, FileWatcher, subagent_batch, AgentContext, 프루닝, 체크포인트, heartbeat, compact_session, prompt builder, flush 안전마진
 - 지능 갭 7개: 플러시 에이전트 루프, auto_recall, 체크포인트 복원, 컨텍스트 진단, 큐레이션, 진단 자동 조정, auto-recall 스코프
@@ -135,7 +135,7 @@ cd ~/miniclaw
 source .venv/bin/activate
 pip install -e .
 openclaw-py              # 대화형 REPL
-python test_live.py      # 테스트 (45개)
+python tests/test_live.py [--offline]  # 테스트 (57개, --offline: 오프라인만)
 ```
 
 ## 주의사항

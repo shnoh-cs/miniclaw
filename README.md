@@ -254,19 +254,19 @@ REPL에서 `/context` 명령으로 진단 보고서 확인 가능.
 
 ```bash
 # 전체 테스트 (57개: 오프라인 44 + 라이브 13)
-python test_live.py
+python tests/test_live.py
 
 # 오프라인만
-python test_live.py --offline
+python tests/test_live.py --offline
 
 # Intelligence Eval Suite (8개 시나리오)
-python eval/eval_intelligence.py
+python tests/eval/eval_intelligence.py
 
 # Golden Parity Eval (원본 OpenClaw 대비 8개 섹션)
-python eval/eval_parity.py
+python tests/eval/eval_parity.py
 ```
 
-### 테스트 구성 (`test_live.py`)
+### 테스트 구성 (`tests/test_live.py`)
 
 #### 1. 단위 테스트 — 오프라인 12개
 | 테스트 | 검증 내용 |
@@ -302,7 +302,7 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 
 ---
 
-## Intelligence Eval Suite (`eval/eval_intelligence.py`)
+## Intelligence Eval Suite (`tests/eval/eval_intelligence.py`)
 
 ### 설계 원칙
 
@@ -559,7 +559,7 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 
 ---
 
-## Golden Parity Eval Suite (`eval/eval_parity.py`)
+## Golden Parity Eval Suite (`tests/eval/eval_parity.py`)
 
 ### 설계 원칙
 
@@ -835,10 +835,11 @@ miniclaw/
 │   ├── config.py           #   TOML 설정
 │   ├── tokenizer.py        #   tiktoken 토큰 추정
 │   └── repl.py             #   대화형 REPL
-├── eval/                   # Eval Suites
-│   ├── eval_intelligence.py  # Intelligence Eval (8개 시나리오)
-│   └── eval_parity.py        # Golden Parity Eval (8개 섹션)
-├── test_live.py            # 테스트 (57개: 오프라인 44 + 라이브 13)
+├── tests/                  # 테스트 & Eval Suites
+│   ├── test_live.py          # 통합 테스트 (57개: 오프라인 44 + 라이브 13)
+│   └── eval/
+│       ├── eval_intelligence.py  # Intelligence Eval (8개 시나리오)
+│       └── eval_parity.py        # Golden Parity Eval (8개 섹션)
 ├── config.example.toml     # 설정 예시
 ├── pyproject.toml          # 빌드 설정
 └── CLAUDE.md               # 개발 컨텍스트
