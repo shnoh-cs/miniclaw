@@ -270,6 +270,8 @@ class Agent:
 
     def _wire_memory_tools(self, searcher: MemorySearcher) -> None:
         """Replace memory tool stubs with real implementations."""
+        from openclaw.memory.search import clamp_results_by_chars
+
         async def memory_search(args: dict[str, Any]) -> ToolResult:
             query = args.get("query", "")
             max_results = int(args.get("max_results", 10))
@@ -279,6 +281,8 @@ class Agent:
                 results = await searcher.search(query, max_results=max_results)
                 if not results:
                     return ToolResult(tool_use_id="", content="No results found")
+                # Clamp total injected text to 8000 chars to avoid context bloat
+                results = clamp_results_by_chars(results, char_budget=8000)
                 lines = []
                 for r in results:
                     lines.append(

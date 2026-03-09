@@ -397,10 +397,10 @@ async def test_wiring_memory_get_registered(agent) -> tuple[bool, str]:
 async def test_wiring_memory_get_executes(agent) -> tuple[bool, str]:
     """#1: memory_get 스텁이 실행 가능한지."""
     from openclaw.tools.builtins.memory_tool import execute_memory_get
-    # 존재하지 않는 파일 → is_error=True, 크래시 없음
+    # 존재하지 않는 파일 → 빈 텍스트 반환 (에러가 아님, 원본 OpenClaw 동작)
     result = await execute_memory_get({"path": "/nonexistent/file.md", "line_start": 1, "line_end": 5})
-    ok = result.is_error and "not found" in result.content.lower()
-    return ok, f"에러 응답: {result.content[:60]}"
+    ok = not result.is_error and "not found" in result.content.lower()
+    return ok, f"응답: {result.content[:60]}"
 
 
 async def test_wiring_memory_flush_writes_file(agent) -> tuple[bool, str]:
@@ -719,17 +719,22 @@ async def test_diagnosis_auto_apply(agent) -> tuple[bool, str]:
     from openclaw.agent.types import AgentMessage, TextBlock
 
     # 85%+ 시나리오: reserve_tokens_floor 와 tool_result_max_ratio 조정
-    # 120K chars ≈ 30K tokens → 30K/32768 ≈ 91% utilization (85%+ 경로)
+    # tiktoken은 반복 문자를 효율적으로 압축하므로 다양한 텍스트 사용
+    import random
+    random.seed(42)
+    words = ["hello", "world", "test", "data", "function", "variable", "class",
+             "method", "import", "return", "async", "await", "error", "config"]
+    varied_text = " ".join(random.choice(words) for _ in range(20000))
     messages = [
-        AgentMessage(role="user", content=[TextBlock(text="x" * 120000)]),
+        AgentMessage(role="user", content=[TextBlock(text=varied_text)]),
     ]
     config = ContextConfig(
-        max_tokens=32768,
+        max_tokens=20000,  # smaller window so ~20K tokens hits 100%+
         reserve_tokens_floor=5000,
         tool_result_max_ratio=0.3,
         compaction_threshold=0.7,
     )
-    diag = diagnose_context(messages, "sys" * 100, max_tokens=32768)
+    diag = diagnose_context(messages, "sys" * 100, max_tokens=20000)
     adjustments = diag.apply_adjustments(config)
     ok1 = len(adjustments) >= 1
     ok2 = config.reserve_tokens_floor > 5000 or config.tool_result_max_ratio < 0.3
@@ -882,27 +887,31 @@ async def test_double_flush_guard(agent) -> tuple[bool, str]:
     from openclaw.config import CompactionConfig
     from openclaw.agent.types import AgentMessage, TextBlock
     import tempfile
+    import random
 
     with tempfile.TemporaryDirectory() as tmpdir:
         session = SessionManager(Path(tmpdir), "test-double-flush")
         session._loaded = True
-        # 큰 메시지로 토큰 임계값 초과
+        # 다양한 텍스트로 토큰 임계값 초과 (tiktoken은 반복 문자 압축)
+        random.seed(99)
+        words = ["hello", "world", "test", "config", "session", "memory", "agent", "tool"]
+        big_text = " ".join(random.choice(words) for _ in range(20000))
         session.messages = [
-            AgentMessage(role="user", content=[TextBlock(text="x" * 120000)]),
+            AgentMessage(role="user", content=[TextBlock(text=big_text)]),
         ]
         config = CompactionConfig()
 
         # 플러시 카운터 초기화
         _last_flush_compaction_count.pop("test-double-flush", None)
 
-        # 첫 번째: should_flush → True
-        ok1 = await should_flush(session, config, 32768)
+        # 첫 번째: should_flush → True (context_max_tokens를 낮춰서 임계 초과)
+        ok1 = await should_flush(session, config, 22000)
 
         # mark_flushed 후
         mark_flushed(session)
 
         # 두 번째: 같은 컴팩션 사이클 → False (더블 플러시 방지)
-        ok2 = not await should_flush(session, config, 32768)
+        ok2 = not await should_flush(session, config, 22000)
 
         # 클린업
         _last_flush_compaction_count.pop("test-double-flush", None)
@@ -933,24 +942,28 @@ async def test_workspace_access_check(agent) -> tuple[bool, str]:
     from openclaw.config import CompactionConfig, WorkspaceConfig
     from openclaw.agent.types import AgentMessage, TextBlock
     import tempfile
+    import random
 
     with tempfile.TemporaryDirectory() as tmpdir:
         session = SessionManager(Path(tmpdir), "test-ro")
         session._loaded = True
+        random.seed(101)
+        words = ["hello", "world", "test", "config", "session", "memory", "agent", "tool"]
+        big_text = " ".join(random.choice(words) for _ in range(20000))
         session.messages = [
-            AgentMessage(role="user", content=[TextBlock(text="x" * 120000)]),
+            AgentMessage(role="user", content=[TextBlock(text=big_text)]),
         ]
         config = CompactionConfig()
         _last_flush_compaction_count.pop("test-ro", None)
 
-        # rw → True
-        ok1 = await should_flush(session, config, 32768, workspace_access="rw")
+        # rw → True (context_max_tokens를 낮춰서 임계 초과)
+        ok1 = await should_flush(session, config, 22000, workspace_access="rw")
 
         # ro → False
-        ok2 = not await should_flush(session, config, 32768, workspace_access="ro")
+        ok2 = not await should_flush(session, config, 22000, workspace_access="ro")
 
         # none → False
-        ok3 = not await should_flush(session, config, 32768, workspace_access="none")
+        ok3 = not await should_flush(session, config, 22000, workspace_access="none")
 
         # WorkspaceConfig.writable 속성 확인
         ws_rw = WorkspaceConfig(access="rw")
@@ -961,6 +974,130 @@ async def test_workspace_access_check(agent) -> tuple[bool, str]:
 
     ok = ok1 and ok2 and ok3 and ok4
     return ok, f"rw={ok1}, ro_skip={ok2}, none_skip={ok3}, config={ok4}"
+
+
+# ── 4차 갭 수정 테스트 ─────────────────────────────────────
+
+
+async def test_memory_get_missing_file(agent) -> tuple[bool, str]:
+    """memory_get이 없는 파일에 대해 에러 대신 빈 텍스트를 반환하는지 확인."""
+    from openclaw.tools.builtins.memory_tool import execute_memory_get
+
+    result = await execute_memory_get({"path": "/tmp/nonexistent_openclaw_test_file.md", "line_start": 1, "line_end": 10})
+    ok1 = not result.is_error  # should NOT be an error
+    ok2 = "file not found" in result.content.lower() or "empty" in result.content.lower()
+    ok3 = "/tmp/nonexistent_openclaw_test_file.md" in result.content  # path preserved
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"not_error={ok1}, has_info={ok2}, path_in_content={ok3}"
+
+
+async def test_clamp_results_wired(agent) -> tuple[bool, str]:
+    """clamp_results_by_chars가 memory_search 핸들러에 연결되었는지 확인."""
+    import inspect
+    # Check that _wire_memory_tools imports and uses clamp_results_by_chars
+    source = inspect.getsource(agent._wire_memory_tools)
+    ok1 = "clamp_results_by_chars" in source
+    ok2 = "char_budget" in source
+
+    # Also verify the function itself works correctly
+    from openclaw.memory.search import SearchResult, clamp_results_by_chars
+    from openclaw.memory.store import MemoryChunk
+
+    chunks = [
+        SearchResult(
+            chunk=MemoryChunk(file_path="a.md", line_start=1, line_end=1, text="x" * 3000),
+            final_score=0.9,
+        ),
+        SearchResult(
+            chunk=MemoryChunk(file_path="b.md", line_start=1, line_end=1, text="y" * 3000),
+            final_score=0.8,
+        ),
+        SearchResult(
+            chunk=MemoryChunk(file_path="c.md", line_start=1, line_end=1, text="z" * 3000),
+            final_score=0.7,
+        ),
+    ]
+    clamped = clamp_results_by_chars(chunks, char_budget=5000)
+    ok3 = len(clamped) == 2  # 3000 + 3000 > 5000, only first 2 fit (3000 < 5000, 6000 > 5000)
+    # Actually: first chunk 3000 fits (total=3000), second 3000+3000=6000 > 5000 but clamped has 1 result?
+    # No: the function says "if total_chars + text_len > char_budget and clamped:" so:
+    # chunk 0: total=0+3000=3000 < 5000 → add, total=3000
+    # chunk 1: total=3000+3000=6000 > 5000 and clamped has 1 → break
+    ok3 = len(clamped) == 1  # only first chunk fits within 5000 budget
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"import={ok1}, budget_param={ok2}, clamp_works={ok3}"
+
+
+async def test_double_compaction_guard(agent) -> tuple[bool, str]:
+    """연속 컴팩션 방지 가드 확인."""
+    from openclaw.agent.loop import _has_new_conversation_since_compaction
+    from openclaw.agent.types import AgentMessage, CompactionEntry, TextBlock
+
+    # Mock session with no compaction entries → should allow
+    class FakeSession:
+        def __init__(self):
+            self.messages = []
+            self.compaction_entries = []
+
+    session = FakeSession()
+    ok1 = _has_new_conversation_since_compaction(session)  # no prior compaction → True
+
+    # After compaction with < 4 messages → should block
+    session.compaction_entries = [CompactionEntry(summary="test", tokens_before=100, tokens_after=50)]
+    session.messages = [
+        AgentMessage(role="assistant", content=[TextBlock(text="hi")]),
+    ]
+    ok2 = not _has_new_conversation_since_compaction(session)  # only 1 msg, < 4 → False
+
+    # With enough messages → should allow
+    session.messages = [
+        AgentMessage(role="user", content=[TextBlock(text="q1")]),
+        AgentMessage(role="assistant", content=[TextBlock(text="a1")]),
+        AgentMessage(role="user", content=[TextBlock(text="q2")]),
+        AgentMessage(role="assistant", content=[TextBlock(text="a2")]),
+    ]
+    ok3 = _has_new_conversation_since_compaction(session)  # 4 msgs → True
+
+    ok = ok1 and ok2 and ok3
+    return ok, f"no_prior={ok1}, block_empty={ok2}, allow_full={ok3}"
+
+
+async def test_tiktoken_estimation(agent) -> tuple[bool, str]:
+    """tiktoken 기반 토큰 추정이 한국어에서 len//4보다 정확한지 확인."""
+    from openclaw.tokenizer import estimate_tokens
+
+    # Korean text: tiktoken should give more tokens than len//4
+    korean = "안녕하세요. 이것은 한국어 테스트입니다. 토큰 추정 정확도를 확인합니다."
+    naive_estimate = len(korean) // 4
+    tiktoken_estimate = estimate_tokens(korean)
+
+    # tiktoken should produce MORE tokens for Korean (each char ≈ 2-3 tokens)
+    ok1 = tiktoken_estimate > naive_estimate
+
+    # English text: should be roughly similar
+    english = "Hello, this is an English test for token estimation accuracy."
+    eng_naive = len(english) // 4
+    eng_tiktoken = estimate_tokens(english)
+    # For English, tiktoken and naive should be in the same ballpark
+    ok2 = 0.5 < (eng_tiktoken / max(1, eng_naive)) < 2.0
+
+    # Empty string
+    ok3 = estimate_tokens("") == 0
+
+    # Verify SessionManager.estimate_tokens uses the new approach
+    from openclaw.session.manager import SessionManager
+    import inspect
+    source = inspect.getsource(SessionManager.estimate_tokens)
+    ok4 = "tokenizer" in source or "estimate_tokens" in source
+
+    ok = ok1 and ok2 and ok3 and ok4
+    return ok, (
+        f"korean_better={ok1} (tiktoken={tiktoken_estimate} vs naive={naive_estimate}), "
+        f"english_sane={ok2} (tiktoken={eng_tiktoken} vs naive={eng_naive}), "
+        f"empty={ok3}, wired={ok4}"
+    )
 
 
 # ── 메인 ─────────────────────────────────────────────────
@@ -1028,6 +1165,13 @@ async def main() -> None:
     await run_test("더블 플러시 방지", test_double_flush_guard(agent))
     await run_test("플러시 전체 컨텍스트", test_flush_full_context(agent))
     await run_test("워크스페이스 접근 체크", test_workspace_access_check(agent))
+
+    # ── 4차 갭 수정 검증 (오프라인) ──
+    header("3c. 4차 갭 수정 (오프라인)")
+    await run_test("memory_get 빈 파일 처리", test_memory_get_missing_file(agent))
+    await run_test("clamp_results_by_chars 연결", test_clamp_results_wired(agent))
+    await run_test("연속 컴팩션 방지", test_double_compaction_guard(agent))
+    await run_test("tiktoken 토큰 추정", test_tiktoken_estimation(agent))
 
     # ── 라이브 테스트 (API 호출) ──
     header("4. 라이브 테스트 (API 호출)")

@@ -286,16 +286,21 @@ class SessionManager:
             self._rewrite()
 
     def estimate_tokens(self) -> int:
-        """Estimate total tokens using 4 chars per token heuristic."""
-        total_chars = 0
+        """Estimate total tokens using tiktoken (cl100k_base).
+
+        Falls back to len//3 if tiktoken is unavailable.
+        More accurate than the naive len//4, especially for Korean/CJK text.
+        """
+        from openclaw.tokenizer import estimate_tokens as _est
+        total = 0
         for msg in self.messages:
             for block in msg.content:
                 if isinstance(block, TextBlock):
-                    total_chars += len(block.text)
+                    total += _est(block.text)
                 elif isinstance(block, ToolUseBlock):
-                    total_chars += len(json.dumps(block.input)) + len(block.name)
+                    total += _est(json.dumps(block.input)) + _est(block.name)
                 elif isinstance(block, ToolResultBlock):
-                    total_chars += len(block.content)
+                    total += _est(block.content)
                 elif isinstance(block, ImageBlock):
-                    total_chars += 8000  # images ≈ 8000 chars
-        return total_chars // 4
+                    total += 2000  # images ≈ 2000 tokens
+        return total

@@ -143,18 +143,20 @@ def diagnose_context(
 ) -> ContextDiagnosis:
     """Analyze context window usage and provide actionable recommendations."""
 
-    # Estimate tokens (rough: 4 chars per token)
-    system_tokens = len(system_prompt) // 4
+    from openclaw.tokenizer import estimate_tokens as _est
+
+    system_tokens = _est(system_prompt)
 
     tool_tokens = 0
     if tool_definitions:
+        tool_chars = 0
         for td in tool_definitions:
-            tool_tokens += len(td.name) + len(td.description)
+            tool_chars += len(td.name) + len(td.description)
             for p in td.parameters:
-                tool_tokens += len(p.name) + len(p.description)
-        tool_tokens = tool_tokens // 4
+                tool_chars += len(p.name) + len(p.description)
+        tool_tokens = _est(" " * tool_chars)  # approximate via length
 
-    compaction_tokens = len(compaction_summary) // 4 if compaction_summary else 0
+    compaction_tokens = _est(compaction_summary) if compaction_summary else 0
 
     session_tokens = 0
     tool_result_count = 0
@@ -163,14 +165,14 @@ def diagnose_context(
         for block in m.content:
             if isinstance(block, ToolResultBlock):
                 tool_result_count += 1
-                session_tokens += len(block.content) // 4
+                session_tokens += _est(block.content)
                 if len(block.content) > 10000:
                     large_result_count += 1
             elif isinstance(block, TextBlock):
-                session_tokens += len(block.text) // 4
+                session_tokens += _est(block.text)
             elif isinstance(block, ToolUseBlock):
                 try:
-                    session_tokens += len(json.dumps(block.input)) // 4
+                    session_tokens += _est(json.dumps(block.input))
                 except Exception:
                     session_tokens += 32
 

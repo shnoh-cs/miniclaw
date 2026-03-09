@@ -68,7 +68,9 @@ async def execute_memory_get(args: dict[str, Any], **_: Any) -> ToolResult:
 
     p = Path(file_path)
     if not p.exists():
-        return ToolResult(tool_use_id="", content=f"File not found: {file_path}", is_error=True)
+        # Return empty text with path (not an error) — matches original OpenClaw behavior.
+        # The model can decide what to do with the missing file information.
+        return ToolResult(tool_use_id="", content=f"# {file_path}\n(file not found — empty)")
 
     # Clamp to valid range
     if line_start < 1:
@@ -79,7 +81,10 @@ async def execute_memory_get(args: dict[str, Any], **_: Any) -> ToolResult:
     try:
         all_lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
-        return ToolResult(tool_use_id="", content=f"Error reading file: {e}", is_error=True)
+        return ToolResult(tool_use_id="", content=f"# {file_path}\n(read error: {e})")
+
+    if not all_lines:
+        return ToolResult(tool_use_id="", content=f"# {file_path}\n(empty file)")
 
     # Convert to 0-based indices, clamp to file length
     start_idx = line_start - 1
@@ -88,8 +93,7 @@ async def execute_memory_get(args: dict[str, Any], **_: Any) -> ToolResult:
     if start_idx >= len(all_lines):
         return ToolResult(
             tool_use_id="",
-            content=f"line_start ({line_start}) exceeds file length ({len(all_lines)} lines)",
-            is_error=True,
+            content=f"# {file_path}\n(line_start {line_start} exceeds file length {len(all_lines)})",
         )
 
     selected = all_lines[start_idx:end_idx]

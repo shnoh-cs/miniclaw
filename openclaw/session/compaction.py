@@ -343,7 +343,8 @@ def strip_tool_result_details(messages: list[AgentMessage]) -> list[AgentMessage
 
 
 def _estimate_tokens(text: str) -> int:
-    return len(text) // 4
+    from openclaw.tokenizer import estimate_tokens
+    return estimate_tokens(text)
 
 
 def _messages_to_text(messages: list[AgentMessage]) -> str:

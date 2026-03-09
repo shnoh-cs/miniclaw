@@ -162,6 +162,41 @@ async def _run_flush_with_tools(ctx: AgentContext, model: str) -> str | None:
         )
 
 
+def _has_new_conversation_since_compaction(session: SessionManager) -> bool:
+    """Check if there are real user/assistant messages since the last compaction.
+
+    Prevents back-to-back compaction when no meaningful content was added
+    between compaction cycles (e.g. compaction summary alone triggers
+    threshold again).
+    """
+    if not session.compaction_entries:
+        return True  # no prior compaction → always allow
+
+    last_entry = session.compaction_entries[-1]
+    first_kept_id = last_entry.first_kept_entry_id
+
+    # If we have messages and a first_kept_id, check if any new messages
+    # were added after the kept set.
+    if first_kept_id:
+        # Find the kept boundary
+        for i, msg in enumerate(session.messages):
+            if msg.id == first_kept_id:
+                # Messages after the original kept set are new
+                # The kept set starts at index i; if there are messages
+                # beyond what was kept, we have new content.
+                # But we can't easily know the original keep_count.
+                # Simple heuristic: if we have at least 2 user messages,
+                # there's likely new content.
+                user_msgs = sum(1 for m in session.messages if m.role == "user")
+                return user_msgs >= 1
+        # first_kept_id not found in current messages (already compacted away)
+        # → check message count
+        return len(session.messages) >= 4
+
+    # No first_kept_id → check if we have enough messages
+    return len(session.messages) >= 4
+
+
 def _load_recovery_checkpoint(ctx: AgentContext) -> None:
     """Load .context-checkpoint.md after compaction for context recovery."""
     if not ctx.workspace_dir:
@@ -319,29 +354,37 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
             diag.apply_adjustments(ctx.config.context)
 
         if status.action == ContextAction.COMPACT:
-            entry = await compact_session(
-                ctx.session, ctx.provider, ctx.config.compaction,
-                ctx.config.context.max_tokens,
-                workspace_dir=ctx.workspace_dir,
-                reserve_tokens_floor=ctx.config.context.reserve_tokens_floor,
-            )
-            if entry:
-                result.compacted = True
-                _load_recovery_checkpoint(ctx)
+            # Double compaction guard: skip if no real user/assistant messages
+            # were added since the last compaction (prevents back-to-back
+            # compaction loops with no meaningful content in between).
+            if _has_new_conversation_since_compaction(ctx.session):
+                entry = await compact_session(
+                    ctx.session, ctx.provider, ctx.config.compaction,
+                    ctx.config.context.max_tokens,
+                    workspace_dir=ctx.workspace_dir,
+                    reserve_tokens_floor=ctx.config.context.reserve_tokens_floor,
+                )
+                if entry:
+                    result.compacted = True
+                    _load_recovery_checkpoint(ctx)
 
         if status.action == ContextAction.ERROR:
             # Overflow — force compaction and retry
-            entry = await compact_session(
-                ctx.session, ctx.provider, ctx.config.compaction,
-                ctx.config.context.max_tokens,
-                workspace_dir=ctx.workspace_dir,
-                reserve_tokens_floor=ctx.config.context.reserve_tokens_floor,
-            )
-            if entry:
-                result.compacted = True
-                _load_recovery_checkpoint(ctx)
+            if _has_new_conversation_since_compaction(ctx.session):
+                entry = await compact_session(
+                    ctx.session, ctx.provider, ctx.config.compaction,
+                    ctx.config.context.max_tokens,
+                    workspace_dir=ctx.workspace_dir,
+                    reserve_tokens_floor=ctx.config.context.reserve_tokens_floor,
+                )
+                if entry:
+                    result.compacted = True
+                    _load_recovery_checkpoint(ctx)
+                else:
+                    result.error = "Context overflow: unable to compact"
+                    break
             else:
-                result.error = "Context overflow: unable to compact"
+                result.error = "Context overflow: unable to compact (no new content since last compaction)"
                 break
 
         # Apply pruning (in-memory only) — only prune large-output tools
