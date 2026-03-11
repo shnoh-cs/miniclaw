@@ -1,4 +1,13 @@
-"""Minimal web server for the OpenClaw agent — SSE streaming chat + cron."""
+"""Minimal web server for the OpenClaw agent — SSE streaming chat + cron.
+
+All endpoints are served under "/" to work behind reverse proxies that
+only forward the root path. Query parameter "action" selects the operation:
+  GET /                          → chat UI (HTML)
+  GET /?action=chat&message=...  → SSE streaming chat
+  GET /?action=history&session_id=... → load previous messages (JSON)
+  GET /?action=cron              → cron job list (JSON)
+  GET /?action=sessions          → active sessions (JSON)
+"""
 
 from __future__ import annotations
 
@@ -10,11 +19,11 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from openclaw.agent.api import Agent
 from openclaw.agent.loop import run
-from openclaw.agent.types import ToolResult
+from openclaw.agent.types import AgentMessage, TextBlock, ToolResult, ToolUseBlock, ToolResultBlock
 
 log = logging.getLogger("openclaw.server")
 
@@ -53,16 +62,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="OpenClaw", lifespan=lifespan)
 
+# CORS — allow all origins for internal network access
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 # ---------------------------------------------------------------------------
-# SSE chat endpoint
+# Single root endpoint — dispatches by "action" query param
 # ---------------------------------------------------------------------------
 
-@app.post("/api/chat")
-async def chat(request: Request) -> StreamingResponse:
-    body = await request.json()
-    message = body.get("message", "").strip()
-    session_id = body.get("session_id", "web")
+@app.get("/")
+async def root(request: Request):
+    action = request.query_params.get("action", "")
+
+    if action == "chat":
+        return await _handle_chat(request)
+    elif action == "history":
+        return _handle_history(request)
+    elif action == "cron":
+        return _handle_cron()
+    elif action == "sessions":
+        return _handle_sessions()
+    else:
+        # Default: serve HTML UI (no-cache to ensure latest version)
+        static_dir = Path(__file__).parent / "static"
+        return FileResponse(
+            static_dir / "index.html",
+            media_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Chat (SSE streaming)
+# ---------------------------------------------------------------------------
+
+async def _handle_chat(request: Request) -> StreamingResponse:
+    message = request.query_params.get("message", "").strip()
+    session_id = request.query_params.get("session_id", "web")
 
     if not message:
         return JSONResponse({"error": "message is required"}, status_code=400)
@@ -96,7 +133,7 @@ async def chat(request: Request) -> StreamingResponse:
         ctx.on_tool_start = on_tool_start
         ctx.on_tool_end = on_tool_end
 
-        async def run_agent() -> RunResult:
+        async def run_agent() -> Any:
             return await run(ctx, message)
 
         task = asyncio.create_task(run_agent())
@@ -109,7 +146,6 @@ async def chat(request: Request) -> StreamingResponse:
                     break
                 yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
             except asyncio.TimeoutError:
-                # Send keepalive comment to prevent proxy timeout
                 yield ": keepalive\n\n"
 
         # Drain remaining events
@@ -129,32 +165,70 @@ async def chat(request: Request) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
+# History — load previous messages for a session
+# ---------------------------------------------------------------------------
+
+def _message_to_dict(msg: AgentMessage) -> dict[str, Any] | None:
+    """Convert an AgentMessage to a simple dict for the frontend."""
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+
+    for block in msg.content:
+        if isinstance(block, TextBlock) and block.text.strip():
+            text_parts.append(block.text)
+        elif isinstance(block, ToolUseBlock):
+            tool_calls.append({"name": block.name, "args": {k: str(v)[:100] for k, v in (block.input if isinstance(block.input, dict) else {}).items()}})
+        elif isinstance(block, ToolResultBlock):
+            ok = not block.is_error
+            preview = (block.content[:200].replace("\n", " ") if isinstance(block.content, str) else "")
+            tool_calls.append({"name": "result", "ok": ok, "preview": preview})
+
+    text = "\n".join(text_parts)
+    if not text and not tool_calls:
+        return None
+
+    return {
+        "role": msg.role,
+        "text": text,
+        "tool_calls": tool_calls if tool_calls else None,
+    }
+
+
+def _handle_history(request: Request) -> JSONResponse:
+    session_id = request.query_params.get("session_id", "web")
+    agent = _get_agent()
+    session = agent._get_session(session_id)
+    session.load()
+
+    messages: list[dict[str, Any]] = []
+    for msg in session.messages:
+        d = _message_to_dict(msg)
+        if d:
+            messages.append(d)
+
+    # Also include compaction summary if present
+    compaction_summary = session.latest_compaction_summary
+
+    return JSONResponse({
+        "session_id": session_id,
+        "messages": messages,
+        "compaction_summary": compaction_summary,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Info endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/api/sessions")
-async def sessions() -> JSONResponse:
-    agent = _get_agent()
-    result = []
-    for sid, mgr in agent._sessions.items():
-        result.append({"id": sid, "messages": len(mgr.messages)})
-    return JSONResponse(result)
-
-
-@app.get("/api/cron")
-async def cron_jobs() -> JSONResponse:
+def _handle_cron() -> JSONResponse:
     agent = _get_agent()
     return JSONResponse(agent.scheduler.status())
 
 
-# ---------------------------------------------------------------------------
-# Static UI
-# ---------------------------------------------------------------------------
-
-@app.get("/")
-async def index() -> FileResponse:
-    static_dir = Path(__file__).parent / "static"
-    return FileResponse(static_dir / "index.html", media_type="text/html")
+def _handle_sessions() -> JSONResponse:
+    agent = _get_agent()
+    result = [{"id": sid, "messages": len(mgr.messages)} for sid, mgr in agent._sessions.items()]
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
@@ -169,10 +243,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="OpenClaw web server")
     parser.add_argument("-p", "--port", type=int, default=8089, help="Port (default: 8089)")
     parser.add_argument("--host", default="0.0.0.0", help="Host (default: 0.0.0.0)")
+    parser.add_argument("--reload", action="store_true", help="Auto-reload on file changes")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    uvicorn.run("openclaw.server:app", host=args.host, port=args.port, log_level="info")
+    uvicorn.run("openclaw.server:app", host=args.host, port=args.port, log_level="info", reload=args.reload)
 
 
 if __name__ == "__main__":

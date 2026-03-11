@@ -109,8 +109,7 @@ def check_missed_jobs(records: list[JobRecord]) -> list[str]:
         if rec.one_shot and rec.run_count > 0:
             continue
         if rec.last_run <= 0:
-            # Never ran — should catch up
-            missed.append(rec.name)
+            # Never ran — new job, wait for next scheduled time
             continue
 
         # Check if any scheduled time was missed since last_run

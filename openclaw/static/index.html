@@ -196,11 +196,8 @@ async function send() {
   let currentToolEl = null;
 
   try {
-    const response = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: text, session_id: sessionEl.value}),
-    });
+    const params = new URLSearchParams({action: 'chat', message: text, session_id: sessionEl.value});
+    const response = await fetch(`?${params}`);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -297,7 +294,7 @@ function toggleCron() {
 
 async function refreshCron() {
   try {
-    const res = await fetch('/api/cron');
+    const res = await fetch('?action=cron');
     const jobs = await res.json();
     if (jobs.length === 0) {
       cronList.innerHTML = '<div class="empty">No scheduled jobs</div>';
@@ -313,6 +310,86 @@ async function refreshCron() {
 
 // Refresh cron every 30s if panel is open
 setInterval(() => { if (cronPanel.classList.contains('show')) refreshCron(); }, 30000);
+
+// ---------------------------------------------------------------------------
+// Load previous messages on page load
+// ---------------------------------------------------------------------------
+let lastMessageCount = 0;
+
+async function loadHistory() {
+  const sid = sessionEl.value;
+  try {
+    const res = await fetch(`?action=history&session_id=${encodeURIComponent(sid)}`);
+    console.log('History response:', res.status, res.headers.get('content-type'));
+    if (!res.ok || !res.headers.get('content-type')?.includes('json')) {
+      console.warn('History: unexpected response', await res.text().then(t => t.slice(0, 200)));
+      return;
+    }
+    const data = await res.json();
+    console.log('History loaded:', data.messages?.length, 'messages');
+
+    messagesEl.innerHTML = '';
+
+    if (data.compaction_summary) {
+      const notice = document.createElement('div');
+      notice.className = 'notice';
+      notice.textContent = '(previous conversation compacted)';
+      messagesEl.appendChild(notice);
+    }
+
+    for (const msg of data.messages) {
+      if (msg.role === 'user' && msg.text) {
+        addMessage('user', msg.text);
+      } else if (msg.role === 'assistant' && msg.text) {
+        addMessage('assistant', msg.text);
+      }
+      // Tool calls from history shown as collapsed summary
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          if (tc.name === 'result') {
+            // skip tool results in history for cleanliness
+          } else {
+            addToolCall(tc.name, tc.args || {}, 'ok');
+          }
+        }
+      }
+    }
+
+    lastMessageCount = data.messages.length;
+    scrollToBottom();
+  } catch (e) {
+    console.warn('Failed to load history:', e);
+  }
+}
+
+// Poll for new messages (cron notifications) every 15s
+async function pollNewMessages() {
+  if (sending) return; // don't poll while actively chatting
+  const sid = sessionEl.value;
+  try {
+    const res = await fetch(`?action=history&session_id=${encodeURIComponent(sid)}`);
+    const data = await res.json();
+    if (data.messages.length > lastMessageCount) {
+      // New messages arrived (likely cron notifications)
+      const newMsgs = data.messages.slice(lastMessageCount);
+      for (const msg of newMsgs) {
+        if (msg.role === 'assistant' && msg.text) {
+          addMessage('assistant', msg.text);
+        }
+      }
+      lastMessageCount = data.messages.length;
+      scrollToBottom();
+    }
+  } catch (e) { /* ignore poll failures */ }
+}
+
+setInterval(pollNewMessages, 15000);
+
+// Load on startup
+loadHistory();
+
+// Reload history when session changes
+sessionEl.addEventListener('change', loadHistory);
 </script>
 </body>
 </html>

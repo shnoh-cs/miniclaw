@@ -485,6 +485,14 @@ class Agent:
 
         self.tool_registry.register(batch_spawn_def, batch_executor, group="subagent")
 
+    def _post_cron_notification(self, job_name: str, text: str, is_error: bool = False) -> None:
+        """Post a cron job result as a message in the 'web' session."""
+        from openclaw.agent.types import AgentMessage, TextBlock
+
+        session = self._get_session("web")
+        session.load()
+        session.append(AgentMessage(role="assistant", content=[TextBlock(text=text)]))
+
     def _make_cron_callback(self, name: str, task_desc: str, one_shot: bool) -> Any:
         """Build a cron callback closure that runs a task through the agent loop."""
         agent_ref = self
@@ -496,8 +504,11 @@ class Agent:
             _one_shot: bool = one_shot,
         ) -> None:
             prompt = (
-                f"You are running a scheduled cron job '{_name}'. "
-                f"Execute the following task:\n\n{_task}"
+                f"Scheduled job '{_name}' has fired. "
+                f"Deliver the following to the user as a direct message. "
+                f"If it's a reminder, just remind them naturally. "
+                f"If it's a task (like fetching news), execute it and show results.\n\n"
+                f"{_task}"
             )
             try:
                 result = await agent_ref.run(
@@ -507,8 +518,10 @@ class Agent:
                 text = result.text or ""
                 if text.strip().upper() != "NO_REPLY":
                     log.info("Cron '%s' output: %s", _name, text[:200])
+                    agent_ref._post_cron_notification(_name, text)
             except Exception as exc:
                 log.warning("Cron '%s' failed: %s", _name, exc)
+                agent_ref._post_cron_notification(_name, str(exc), is_error=True)
 
             # Auto-delete one-shot jobs after completion
             if _one_shot:

@@ -152,20 +152,23 @@ class SessionManager:
 
     def load(self) -> None:
         """Load session from JSONL file."""
-        self.messages.clear()
-        self.compaction_entries.clear()
-
         if self.ephemeral or not self.file_path.exists():
+            self.messages.clear()
+            self.compaction_entries.clear()
             self._loaded = True
             return
 
         try:
             stat = self.file_path.stat()
             if stat.st_mtime == self._file_mtime and self._loaded:
-                return  # cache hit
+                return  # cache hit — keep existing messages
             self._file_mtime = stat.st_mtime
         except OSError:
             log.debug("Failed to stat session file %s", self.file_path, exc_info=True)
+
+        # Clear only when we're actually reloading from disk
+        self.messages.clear()
+        self.compaction_entries.clear()
 
         with open(self.file_path, encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
