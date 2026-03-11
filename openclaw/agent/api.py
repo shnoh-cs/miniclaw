@@ -732,8 +732,9 @@ class Agent:
                     is_error=True,
                 )
 
-            # Pass all args to the manager (it picks what it needs)
-            result = await agent_ref._browser_manager.execute(action, **args)
+            # Pass args excluding 'action' (already extracted as positional)
+            kw = {k: v for k, v in args.items() if k != "action"}
+            result = await agent_ref._browser_manager.execute(action, **kw)
             is_err = result.startswith("Error")
             return ToolResult(tool_use_id="", content=result, is_error=is_err)
 
