@@ -66,8 +66,17 @@ def extract_identifiers(text: str) -> list[str]:
 
 
 def extract_identifiers_from_recent(messages: list[AgentMessage], max_messages: int = 10) -> list[str]:
-    """Extract identifiers from the last N messages only."""
-    from openclaw.session.compaction import _messages_to_text
+    """Extract identifiers from the last N messages only.
+
+    Only considers user/assistant **text** — NOT tool_use arguments or
+    tool_result content, which contain transient data (fetched URLs,
+    scraped HTML, API responses) that should not be treated as
+    conversation identifiers requiring preservation.
+    """
     recent = messages[-max_messages:] if len(messages) > max_messages else messages
-    text = _messages_to_text(recent)
-    return extract_identifiers(text)
+    parts: list[str] = []
+    for msg in recent:
+        text = msg.text
+        if text:
+            parts.append(text)
+    return extract_identifiers("\n".join(parts))
