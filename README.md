@@ -11,7 +11,7 @@
 |------|------|
 | **Agent Python API** | `Agent.from_config()` → `agent.run()` / `agent.stream()` |
 | **듀얼 툴 콜링** | 네이티브 function calling + `<tool_call>` XML 프롬프트 자동 전환 |
-| **11개 내장 도구** | Read, Write, Edit, ApplyPatch, Bash, Process, WebFetch, PDF, Hancom, Image, Memory |
+| **13개 내장 도구** | Read, Write, Edit, ApplyPatch, Bash, Process, WebFetch, PDF, Hancom, Image, Memory(3), Cron, SessionStatus |
 | **다단계 컴팩션** | split→summarize→merge로 장시간 대화에서도 맥락 유지 |
 | **하이브리드 메모리** | BM25 + 벡터 코사인 + MMR 다양성 + 시간 감쇠 (30일 반감기) |
 | **메모리 큐레이션** | 임베딩 기반 반복 패턴 탐지 → MEMORY.md 자동 승격 |
@@ -23,7 +23,7 @@
 | **루프 감지** | 4종 감지기 (repeat, circuit breaker, poll, ping-pong) |
 | **Thinking 레벨** | off→minimal→low→medium→high→xhigh + 자동 폴백 체인 |
 | **Hook 시스템** | pre/post tool_call, pre/post message, on_error |
-| **Cron/Heartbeat** | 주기적 모델 핑, 메모리 체크, 에이전트 루프 기반 실행 |
+| **Cron/Heartbeat** | 3종 스케줄(every/cron/at), 에페머럴 세션, HEARTBEAT.md 에이전트 루프 실행 |
 | **서브에이전트** | 깊이 제한(max 5), 독립 세션, 배치 동시 실행 (Semaphore 3) |
 | **스킬 시스템** | YAML frontmatter, OS/바이너리 게이팅 |
 
@@ -175,7 +175,7 @@ timeout = 10
 │  │  Agent Loop (agent/loop.py)                        │  │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │  │
 │  │  │ Context  │→│  Model   │→│  Tool Registry   │ │  │
-│  │  │  Guard   │  │ Provider │  │  (11 built-in)   │ │  │
+│  │  │  Guard   │  │ Provider │  │  (13 built-in)   │ │  │
 │  │  └──────────┘  └──────────┘  └──────────────────┘ │  │
 │  │       │            │              │                │  │
 │  │       ▼            ▼              ▼                │  │
@@ -253,7 +253,7 @@ REPL에서 `/context` 명령으로 진단 보고서 확인 가능.
 ## 테스트
 
 ```bash
-# 전체 테스트 (57개: 오프라인 44 + 라이브 13)
+# 전체 테스트 (56개: 오프라인 43 + 라이브 13)
 python tests/test_live.py
 
 # 오프라인만
@@ -268,14 +268,16 @@ python tests/eval/eval_parity.py
 
 ### 테스트 구성 (`tests/test_live.py`)
 
-#### 1. 단위 테스트 — 오프라인 12개
+#### 1. 단위 테스트 — 오프라인 14개
 | 테스트 | 검증 내용 |
 |--------|-----------|
 | ContextGuard | 토큰 예산 → OK/COMPACT 에스컬레이션 |
 | ToolRegistry | 도구 등록·조회, 필수 도구 존재 |
 | Session Lanes | 병렬 대화 스레드 생성·병합 |
 | Cron 스케줄러 | 주기 실행·상태 관리 |
-| HookRunner | pre/post hook 호출 |
+| Cron Expression | cron 표현식, timezone, at 스케줄 검증 |
+| Ephemeral Session | 에페머럴 세션 디스크 미기록 검증 |
+| HookRunner | pre/post hook 호출 (shlex 인젝션 방어) |
 | 프롬프트 인젝션 방어 | 13종 패턴 정리 |
 | ThinkingLevel 파싱 | 문자열→enum 변환·폴백 |
 | 세션 영속성 | JSONL 저장·로드 |
@@ -293,10 +295,10 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 #### 4. 라이브 테스트 — API 호출 13개
 단순 대화, Read 도구, Bash 도구, Write→Read 체인, 다중 턴 대화, WebFetch, Edit 도구, 커스텀 도구, 스트리밍 API, 에러 처리, 한국어 응답, 긴 출력 처리, 수학 추론
 
-### 테스트 결과 (2026-03-09)
+### 테스트 결과 (2026-03-11)
 
 ```
-오프라인 44개: ALL PASS
+오프라인 43개: ALL PASS
 라이브 13개: 11/13 PASS (Read 도구, 에러 처리 — LLM 응답 비결정성으로 간헐적 실패)
 ```
 
@@ -799,9 +801,9 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 
 ```
 miniclaw/
-├── openclaw/               # 메인 패키지 (~5,700줄 코어 + ~1,300줄 builtins, 57 모듈)
+├── openclaw/               # 메인 패키지 (~5,900줄 코어 + ~1,400줄 builtins, 61 모듈)
 │   ├── agent/              #   Agent API·에이전트 루프·타입
-│   │   ├── api.py          #     Agent 클래스 (진입점)
+│   │   ├── api.py          #     Agent 클래스 (진입점, 에페머럴 세션 자동 감지)
 │   │   ├── loop.py         #     메인 루프
 │   │   └── types.py        #     메시지·도구·결과 타입
 │   ├── model/              #   LLM 프로바이더·페일오버·thinking
@@ -811,10 +813,11 @@ miniclaw/
 │   │   ├── cooldown.py     #     ProfileCooldown·ApiKeyRotator·백오프
 │   │   └── thinking.py     #     Thinking 레벨 해석·폴백
 │   ├── session/            #   세션·컴팩션·프루닝·lanes·메모리 플러시
+│   │   ├── manager.py      #     JSONL append-only 세션 (ephemeral 지원)
 │   │   ├── compaction.py   #     다단계 컴팩션 (split→summarize→merge)
 │   │   ├── identifiers.py  #     식별자 추출·정규화
 │   │   ├── safeguard.py    #     컴팩션 품질 검증·도구 실패 추적
-│   │   └── ...             #     manager, pruning, lanes, memory_flush
+│   │   └── ...             #     pruning, lanes, memory_flush
 │   ├── context/            #   컨텍스트 가드·자가 진단
 │   ├── memory/             #   SQLite+FTS5+벡터 메모리·큐레이션
 │   │   ├── search.py       #     MemorySearcher (하이브리드 검색 오케스트레이터)
@@ -822,21 +825,21 @@ miniclaw/
 │   │   ├── query.py        #     다국어 쿼리 토큰화·확장·FTS 빌더
 │   │   ├── watchers.py     #     FileWatcher·Reranker·SessionSyncWatcher
 │   │   └── ...             #     store, embeddings, curation
-│   ├── prompt/             #   시스템 프롬프트·인젝션 방어
-│   ├── tools/              #   도구 레지스트리·11개 내장 도구
+│   ├── prompt/             #   시스템 프롬프트·인젝션 방어 (부트스트랩 소독)
+│   ├── tools/              #   도구 레지스트리·13개 내장 도구
 │   │   ├── registry.py     #     ToolRegistry·RegisteredTool
 │   │   ├── loop_detector.py #    4종 루프 감지 (repeat·poll·ping-pong·breaker)
 │   │   ├── truncation.py   #     도구 결과 트렁케이션·세션 가드
-│   │   └── builtins/       #     11개 내장 도구
+│   │   └── builtins/       #     13개 내장 도구 (+ Cron, SessionStatus)
 │   ├── skills/             #   스킬 디스커버리
 │   ├── subagent/           #   서브에이전트
-│   ├── hooks/              #   Hook 시스템
-│   ├── cron/               #   Cron/Heartbeat
+│   ├── hooks/              #   Hook 시스템 (shlex 인젝션 방어)
+│   ├── cron/               #   Cron/Heartbeat (every/cron/at 3종 스케줄)
 │   ├── config.py           #   TOML 설정
 │   ├── tokenizer.py        #   tiktoken 토큰 추정
 │   └── repl.py             #   대화형 REPL
 ├── tests/                  # 테스트 & Eval Suites
-│   ├── test_live.py          # 통합 테스트 (57개: 오프라인 44 + 라이브 13)
+│   ├── test_live.py          # 통합 테스트 (56개: 오프라인 43 + 라이브 13)
 │   └── eval/
 │       ├── eval_intelligence.py  # Intelligence Eval (8개 시나리오)
 │       └── eval_parity.py        # Golden Parity Eval (8개 섹션)

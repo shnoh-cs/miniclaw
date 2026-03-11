@@ -12,64 +12,64 @@ OpenClaw Agent Harness의 Python 포트. 원본의 모든 "지능(intelligence)"
 
 - Python 3.11+, 가상환경: `.venv/`
 - 빌드: hatchling
-- 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile
+- 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile, croniter, python-dateutil
 - 설정: `config.toml` (gitignore됨) / `config.example.toml` (vLLM 예시)
-- 총 소스: ~5,700줄 코어 + ~1,300줄 builtins (57개 모듈)
+- 총 소스: ~5,900줄 코어 + ~1,400줄 builtins (61개 모듈)
 
 ## 디렉토리 구조
 
 ```
 openclaw/
 ├── agent/          # Agent API, 에이전트 루프, 타입 정의
-│   ├── api.py           608줄  Agent 클래스 (Python API 진입점)
+│   ├── api.py           850줄  Agent 클래스 (Python API 진입점)
 │   ├── loop.py          685줄  메인 루프 (run → attempt → stream → tool dispatch)
 │   └── types.py         288줄  AgentMessage, ToolDefinition, RunResult 등
 ├── model/          # LLM 프로바이더, 페일오버
-│   ├── provider.py      408줄  OpenAI 호환 API 클라이언트
+│   ├── provider.py      410줄  OpenAI 호환 API 클라이언트
 │   ├── failover.py      300줄  FailoverManager (프로필 로테이션·상태 영속화)
 │   ├── error_classify.py 329줄  에러 패턴 분류·should_failover 판정
-│   ├── cooldown.py      145줄  ProfileCooldown·ApiKeyRotator·백오프
+│   ├── cooldown.py      162줄  ProfileCooldown·ApiKeyRotator·백오프
 │   └── thinking.py       62줄  Thinking 레벨 해석·폴백
 ├── session/        # 세션 관리, 컴팩션, 프루닝
-│   ├── manager.py       309줄  JSONL append-only 세션
-│   ├── compaction.py    649줄  다단계 컴팩션 (split→summarize→merge)
+│   ├── manager.py       347줄  JSONL append-only 세션 (ephemeral 지원)
+│   ├── compaction.py    708줄  다단계 컴팩션 (split→summarize→merge)
 │   ├── identifiers.py    73줄  식별자 추출·정규화
 │   ├── safeguard.py     326줄  컴팩션 품질 검증·도구 실패 추적
 │   ├── pruning.py       372줄  Cache-TTL 프루닝·이미지 프루닝
 │   ├── lanes.py         150줄  병렬 대화 스레드
-│   └── memory_flush.py   99줄  컴팩션 전 메모리 플러시
+│   └── memory_flush.py  127줄  컴팩션 전 메모리 플러시
 ├── context/        # 컨텍스트 윈도우 관리
 │   ├── guard.py         268줄  토큰 예산·트렁케이션·enforce_budget
 │   └── diagnosis.py     223줄  컨텍스트 자가 진단·설정 자동 조정
 ├── memory/         # 하이브리드 메모리 시스템
 │   ├── store.py         312줄  SQLite + FTS5
-│   ├── search.py        350줄  MemorySearcher (하이브리드 검색 오케스트레이터)
+│   ├── search.py        352줄  MemorySearcher (하이브리드 검색 오케스트레이터)
 │   ├── ranking.py       219줄  cosine·BM25·Jaccard·MMR·시간 감쇠
 │   ├── query.py         177줄  다국어 쿼리 토큰화·확장·FTS 빌더
 │   ├── watchers.py      146줄  FileWatcher·Reranker·SessionSyncWatcher
 │   ├── embeddings.py     61줄  임베딩 프로바이더
 │   └── curation.py      281줄  일별 노트 → MEMORY.md 자동 승격
 ├── prompt/         # 시스템 프롬프트·인젝션 방어
-│   ├── builder.py       316줄  13-섹션 프롬프트 조립
+│   ├── builder.py       333줄  13-섹션 프롬프트 조립 (부트스트랩 파일 소독)
 │   ├── bootstrap.py     138줄  부트스트랩 파일 8종 로딩
 │   └── sanitize.py      406줄  인젝션 방어 (13종 패턴·호모글리프·경계마커)
-├── tools/          # 도구 레지스트리·11개 내장 도구
+├── tools/          # 도구 레지스트리·13개 내장 도구
 │   ├── registry.py       88줄  ToolRegistry·RegisteredTool
 │   ├── loop_detector.py 401줄  4종 루프 감지 (repeat·poll·ping-pong·breaker)
 │   ├── truncation.py    130줄  도구 결과 트렁케이션·세션 가드
-│   └── builtins/       1290줄  Read, Write, Edit, ApplyPatch, Bash, Process,
-│                                WebFetch, PDF, Hancom, Image, Memory(3)
+│   └── builtins/       1410줄  Read, Write, Edit, ApplyPatch, Bash, Process,
+│                                WebFetch, PDF, Hancom, Image, Memory(3), Cron, SessionStatus
 ├── skills/         # 스킬 디스커버리
 │   ├── loader.py        207줄  YAML frontmatter, OS/바이너리 게이팅, 번들 스킬 자동 로드
 │   └── bundled/         번들 스킬 (nano-pdf, himalaya)
 ├── subagent/       # 서브에이전트
 │   └── spawn.py         216줄  깊이 제한(max 5), 도구 정책
-├── hooks/          # Hook 시스템
-│   └── __init__.py       85줄  pre/post tool_call, pre/post message, on_error
-├── cron/           # Cron/Heartbeat
-│   └── __init__.py      276줄  주기적 모델 핑·메모리 체크
-├── config.py       202줄  TOML 설정 로딩
-└── repl.py         131줄  대화형 REPL (슬림 UI 레이어)
+├── hooks/          # Hook 시스템 (shlex 인젝션 방어)
+│   └── __init__.py       87줄  pre/post tool_call, pre/post message, on_error
+├── cron/           # Cron/Heartbeat (3종 스케줄: every, cron, at)
+│   └── __init__.py      377줄  CronScheduler, 모델 핑, 메모리 체크, HEARTBEAT.md
+├── config.py       207줄  TOML 설정 로딩
+└── repl.py         148줄  대화형 REPL (슬림 UI 레이어)
 ```
 
 ## 핵심 아키텍처
@@ -81,6 +81,7 @@ openclaw/
 - `_ensure_initialized()`: 메모리 인덱싱, 세션 인덱싱, 큐레이션 체크 1회 실행
 - `_build_context()`: AgentContext 조립 (도구, 메모리, 세션, 프롬프트)
 - 서브에이전트 도구 (spawn, batch, list, read) 자동 등록
+- 에페머럴 세션: `cron-`, `heartbeat` 접두사 세션은 자동으로 디스크 I/O 없이 메모리만 사용
 
 ### 에이전트 루프 (`agent/loop.py`)
 - `run()` → `_attempt_loop()` → stream → tool dispatch → re-entry (최대 50턴)
@@ -122,8 +123,8 @@ openclaw/
 
 ## 테스트
 
-### `tests/test_live.py` — 57개 테스트
-- 오프라인 12개: ContextGuard, ToolRegistry, SessionLanes, Cron, Hook, 인젝션 방어, ThinkingLevel, 세션 영속성, 트렁케이션, 루프 감지, ApplyPatch, Failover
+### `tests/test_live.py` — 56개 테스트
+- 오프라인 14개: ContextGuard, ToolRegistry, SessionLanes, Cron, Hook, 인젝션 방어, ThinkingLevel, 세션 영속성, 트렁케이션, 루프 감지, ApplyPatch, Failover, Cron Expression, Ephemeral Session
 - 배관 공사 13개: memory_get, 플러시, Thinking API, FileWatcher, subagent_batch, AgentContext, 프루닝, 체크포인트, heartbeat, compact_session, prompt builder, flush 안전마진
 - 지능 갭 7개: 플러시 에이전트 루프, auto_recall, 체크포인트 복원, 컨텍스트 진단, 큐레이션, 진단 자동 조정, auto-recall 스코프
 - 라이브 13개: 대화, Read, Bash, Write→Read, 다중 턴, WebFetch, Edit, 커스텀 도구, 스트리밍, 에러 처리, 한국어, 긴 출력, 수학 추론
@@ -135,7 +136,7 @@ cd ~/miniclaw
 source .venv/bin/activate
 pip install -e .
 openclaw-py              # 대화형 REPL
-python tests/test_live.py [--offline]  # 테스트 (57개, --offline: 오프라인만)
+python tests/test_live.py [--offline]  # 테스트 (56개, --offline: 오프라인만)
 ```
 
 ## 주의사항
