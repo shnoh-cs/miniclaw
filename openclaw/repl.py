@@ -26,24 +26,29 @@ def main() -> None:
     console.print("[bold]OpenClaw-Py Agent[/bold]")
     console.print(f"Model: {agent.config.models.default}")
     console.print(f"Workspace: {agent.workspace}")
-    console.print("Type /quit to exit, /new for new session, /context for diagnosis\n")
+    console.print("Type /quit to exit, /new for new session, /context for diagnosis, /cron for jobs\n")
 
     session_id = "repl"
 
     async def repl_loop() -> None:
         nonlocal session_id
 
+        # Start heartbeat/cron scheduler
+        await agent.start_heartbeat()
+
         while True:
             try:
                 user_input = console.input("[bold green]> [/bold green]")
             except (EOFError, KeyboardInterrupt):
                 console.print("\nGoodbye!")
+                await agent.stop_heartbeat()
                 break
 
             if not user_input.strip():
                 continue
 
             if user_input.strip() == "/quit":
+                await agent.stop_heartbeat()
                 break
 
             if user_input.strip() == "/new":
@@ -71,6 +76,18 @@ def main() -> None:
                     compaction_summary=ctx.session.latest_compaction_summary,
                 )
                 console.print(f"[dim]{diag.format()}[/dim]")
+                continue
+
+            if user_input.strip() == "/cron":
+                status = agent.scheduler.status()
+                if not status:
+                    console.print("[dim]No scheduled tasks[/dim]")
+                else:
+                    for s in status:
+                        console.print(
+                            f"[dim]{s['name']}: {s['status']} "
+                            f"(interval={s['interval']}s, runs={s['run_count']})[/dim]"
+                        )
                 continue
 
             if user_input.strip() == "/compact":

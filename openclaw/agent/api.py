@@ -103,6 +103,13 @@ class Agent:
         # Register subagent tools
         self._register_subagent_tools()
 
+        # Cron/heartbeat scheduler (must init before cron tool registration)
+        self._scheduler = CronScheduler()
+
+        # Register cron + session_status tools (need agent/scheduler refs)
+        self._register_cron_tools()
+        self._register_session_status_tool()
+
         # Memory
         self._memory_store: MemoryStore | None = None
         self._memory_searcher: MemorySearcher | None = None
@@ -113,9 +120,6 @@ class Agent:
 
         # Session lanes (per session)
         self._lane_managers: dict[str, LaneManager] = {}
-
-        # Cron/heartbeat scheduler
-        self._scheduler = CronScheduler()
 
     @classmethod
     def from_config(cls, path: str | Path | None = None) -> Agent:
@@ -469,6 +473,201 @@ class Agent:
             return ToolResult(tool_use_id="", content="\n\n---\n\n".join(output_parts))
 
         self.tool_registry.register(batch_spawn_def, batch_executor, group="subagent")
+
+    def _register_cron_tools(self) -> None:
+        """Register cron tool — manage scheduled jobs at runtime."""
+        import time as _time
+
+        from openclaw.tools.builtins.cron_tool import DEFINITION as cron_def
+
+        agent_ref = self
+        scheduler = self._scheduler
+
+        async def cron_executor(args: dict[str, Any]) -> ToolResult:
+            action = (args.get("action") or "").strip().lower()
+
+            if action == "list":
+                jobs = scheduler.status()
+                if not jobs:
+                    return ToolResult(tool_use_id="", content="No scheduled jobs.")
+                lines = []
+                for j in jobs:
+                    lines.append(
+                        f"- {j['name']}: {j['status']} "
+                        f"(interval={j['interval']}s, runs={j['run_count']}, "
+                        f"one_shot={j['one_shot']})"
+                    )
+                return ToolResult(tool_use_id="", content="\n".join(lines))
+
+            elif action == "create":
+                name = args.get("name", "")
+                interval = args.get("interval_seconds")
+                task_desc = args.get("task", "")
+                one_shot = bool(args.get("one_shot", False))
+
+                if not name:
+                    return ToolResult(
+                        tool_use_id="", content="Error: name is required for create",
+                        is_error=True,
+                    )
+                if not interval or int(interval) <= 0:
+                    return ToolResult(
+                        tool_use_id="",
+                        content="Error: interval_seconds must be a positive integer",
+                        is_error=True,
+                    )
+                if not task_desc:
+                    return ToolResult(
+                        tool_use_id="", content="Error: task is required for create",
+                        is_error=True,
+                    )
+
+                interval = int(interval)
+
+                # Build callback that runs task through the agent loop
+                async def _cron_callback(
+                    _task: str = task_desc,
+                    _name: str = name,
+                    _one_shot: bool = one_shot,
+                ) -> None:
+                    prompt = (
+                        f"You are running a scheduled cron job '{_name}'. "
+                        f"Execute the following task:\n\n{_task}"
+                    )
+                    try:
+                        result = await agent_ref.run(
+                            prompt,
+                            session_id=f"cron-{_name}-{int(_time.time())}",
+                        )
+                        text = result.text or ""
+                        if text.strip().upper() != "NO_REPLY":
+                            log.info("Cron '%s' output: %s", _name, text[:200])
+                    except Exception as exc:
+                        log.warning("Cron '%s' failed: %s", _name, exc)
+
+                    # Auto-delete one-shot jobs after completion
+                    if _one_shot:
+                        scheduler.unregister(_name)
+
+                scheduler.register(
+                    name, _cron_callback, interval=interval, one_shot=one_shot,
+                )
+
+                # Auto-start scheduler if not running
+                if not scheduler._running:
+                    await scheduler.start()
+                else:
+                    # Start the newly registered task immediately
+                    from openclaw.cron import TaskStatus
+
+                    task_obj = scheduler._tasks.get(name)
+                    if task_obj and task_obj.status in (
+                        TaskStatus.PENDING, TaskStatus.COMPLETED,
+                    ):
+                        import asyncio as _aio
+
+                        task_obj._task = _aio.create_task(
+                            scheduler._run_loop(task_obj),
+                            name=f"cron-{name}",
+                        )
+                        task_obj.status = TaskStatus.RUNNING
+
+                return ToolResult(
+                    tool_use_id="",
+                    content=(
+                        f"Created cron job '{name}': interval={interval}s, "
+                        f"one_shot={one_shot}\nTask: {task_desc}"
+                    ),
+                )
+
+            elif action == "delete":
+                name = args.get("name", "")
+                if not name:
+                    return ToolResult(
+                        tool_use_id="", content="Error: name is required for delete",
+                        is_error=True,
+                    )
+                removed = scheduler.unregister(name)
+                if removed:
+                    return ToolResult(
+                        tool_use_id="", content=f"Deleted cron job '{name}'.",
+                    )
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"No cron job named '{name}' found.",
+                    is_error=True,
+                )
+
+            elif action == "status":
+                name = args.get("name", "")
+                if not name:
+                    return ToolResult(
+                        tool_use_id="", content="Error: name is required for status",
+                        is_error=True,
+                    )
+                jobs = scheduler.status()
+                for j in jobs:
+                    if j["name"] == name:
+                        return ToolResult(
+                            tool_use_id="",
+                            content=(
+                                f"Job: {j['name']}\n"
+                                f"Status: {j['status']}\n"
+                                f"Interval: {j['interval']}s\n"
+                                f"One-shot: {j['one_shot']}\n"
+                                f"Run count: {j['run_count']}\n"
+                                f"Last error: {j['last_error'] or 'none'}"
+                            ),
+                        )
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"No cron job named '{name}' found.",
+                    is_error=True,
+                )
+
+            else:
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"Unknown action '{action}'. Use: list, create, delete, status",
+                    is_error=True,
+                )
+
+        self.tool_registry.register(cron_def, cron_executor, group="cron")
+
+    def _register_session_status_tool(self) -> None:
+        """Register session_status tool — current time, model, token usage."""
+        import datetime
+        import platform
+
+        from openclaw.tools.builtins.session_status_tool import (
+            DEFINITION as status_def,
+        )
+
+        agent_ref = self
+
+        async def status_executor(args: dict[str, Any]) -> ToolResult:
+            now = datetime.datetime.now().astimezone()
+            model = agent_ref.config.models.default
+
+            # Thinking level
+            model_opts = agent_ref.config.models.options.get(model)
+            thinking = getattr(model_opts, "thinking", "off") if model_opts else "off"
+
+            # Scheduler status
+            cron_jobs = agent_ref._scheduler.status()
+            cron_summary = f"{len(cron_jobs)} scheduled job(s)" if cron_jobs else "none"
+
+            lines = [
+                f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                f"Model: {model}",
+                f"Thinking: {thinking}",
+                f"Platform: {platform.system()} ({platform.machine()})",
+                f"Python: {platform.python_version()}",
+                f"Cron jobs: {cron_summary}",
+            ]
+            return ToolResult(tool_use_id="", content="\n".join(lines))
+
+        self.tool_registry.register(status_def, status_executor, group="status")
 
     async def _initial_memory_index(self) -> None:
         """Index existing memory files on first run."""

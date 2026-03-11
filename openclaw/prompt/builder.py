@@ -37,6 +37,8 @@ _CORE_TOOL_SUMMARIES: dict[str, str] = {
     "memory_get": "Read specific lines from a memory file",
     "subagent": "Spawn an isolated sub-agent for parallel subtasks",
     "subagent_batch": "Spawn multiple sub-agents in parallel",
+    "cron": "Manage cron jobs and wake events (use for reminders and recurring tasks)",
+    "session_status": "Show session status: current date/time, model, token usage",
 }
 
 # 도구 표시 순서
@@ -46,6 +48,7 @@ _TOOL_ORDER = [
     "web_fetch", "pdf", "hancom", "image",
     "memory_search", "memory_save", "memory_get",
     "subagent", "subagent_batch",
+    "cron", "session_status",
 ]
 
 
@@ -207,21 +210,11 @@ def build_system_prompt(
     sections.append("\n".join([
         "You are a personal assistant running inside OpenClaw, an AI agent harness.",
         "",
-        "## What You Can Do",
-        "You are NOT a plain LLM — you are an agent with persistent tools and automation:",
-        "- **Execute shell commands** (bash): run scripts, send emails (mailx/sendmail), "
-        "call APIs (curl), manage files, install packages, and anything a terminal can do.",
-        "- **Read/Write/Edit files**: create reports, scripts, configs, and any file type.",
-        "- **Fetch web content** (web_fetch): scrape websites, call REST APIs, gather data.",
-        "- **Analyze images** (image): describe and extract info from images/screenshots.",
-        "- **Persistent memory**: remember facts across sessions (memory_save/memory_search).",
-        "- **Scheduled tasks** (cron/heartbeat): run recurring jobs at intervals "
-        "(e.g. daily reports, periodic monitoring). Define tasks in HEARTBEAT.md.",
-        "- **Sub-agents**: spawn parallel workers for complex multi-step workflows.",
-        "",
-        "When a user asks if something is possible, consider your tools before saying no. "
-        "If a task can be accomplished by combining your tools (e.g. web_fetch + bash + write "
-        "for automated reports), propose and implement the solution.",
+        "You are NOT a plain LLM — you are an agent with persistent tools.",
+        "When a user asks if something is possible, check your available tools "
+        "before saying no. If a task can be accomplished by combining tools "
+        "(e.g. web_fetch + bash + write for automated reports, or cron for "
+        "scheduling), propose and implement the solution.",
     ]))
 
     # 2. Tooling + Tool Call Style
@@ -294,12 +287,16 @@ def build_system_prompt(
         "reply with the alert text instead.",
     ]))
 
-    # 10. Date/Time
-    now = datetime.datetime.now()
+    # 10. Date/Time (timezone only — avoid cache invalidation every turn)
+    try:
+        tz_name = datetime.datetime.now().astimezone().tzname() or "UTC"
+    except Exception:
+        tz_name = "UTC"
     sections.append("\n".join([
         "## Current Date & Time",
-        f"Today is {now.strftime('%Y-%m-%d')}. "
-        f"Current time: {now.strftime('%H:%M:%S')}.",
+        f"Timezone: {tz_name}.",
+        "If you need the current date or time, use the `session_status` tool "
+        "or run `date` via `bash`.",
     ]))
 
     # 11. Runtime (오리지널 buildRuntimeLine 포팅)
