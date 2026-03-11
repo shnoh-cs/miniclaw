@@ -48,6 +48,14 @@ async def execute(args: dict[str, Any], **_: Any) -> ToolResult:
         # Remove script/style tags
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
+        # Convert <a href="url">text</a> → [text](url) to preserve links
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            link_text = a_tag.get_text(strip=True)
+            if href and link_text and not href.startswith(("#", "javascript:")):
+                a_tag.replace_with(f"[{link_text}]({href})")
+            elif href and not href.startswith(("#", "javascript:")):
+                a_tag.replace_with(f"({href})")
         text = soup.get_text(separator="\n", strip=True)
     else:
         text = body

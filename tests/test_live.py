@@ -1401,6 +1401,34 @@ async def test_identity_no_overpromise(agent) -> tuple[bool, str]:
     return ok, f"concise_identity={ok}, bullets={identity.count('- **')}"
 
 
+async def test_ephemeral_session(agent) -> tuple[bool, str]:
+    """Ephemeral 세션이 디스크에 기록되지 않는지 검증."""
+    from openclaw.session.manager import SessionManager
+    from openclaw.agent.types import AgentMessage, TextBlock
+    import tempfile, os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sm = SessionManager(Path(tmpdir), "ephemeral-test", ephemeral=True)
+        sm.load()
+
+        # Append messages — should NOT create a file
+        msg = AgentMessage(role="user", content=[TextBlock(text="hello")])
+        sm.append(msg)
+        sm.append(AgentMessage(role="assistant", content=[TextBlock(text="hi")]))
+
+        file_exists = sm.file_path.exists()
+        in_memory = len(sm.messages) == 2
+
+        # Non-ephemeral should create a file
+        sm2 = SessionManager(Path(tmpdir), "persistent-test")
+        sm2.load()
+        sm2.append(AgentMessage(role="user", content=[TextBlock(text="hello")]))
+        persistent_exists = sm2.file_path.exists()
+
+    ok = not file_exists and in_memory and persistent_exists
+    return ok, f"no_file={not file_exists}, in_memory={in_memory}, persistent_ok={persistent_exists}"
+
+
 # ── 메인 ─────────────────────────────────────────────────
 
 
@@ -1493,6 +1521,7 @@ async def main() -> None:
     await run_test("cron 생성/조회/삭제", test_cron_tool_create_delete(agent))
     await run_test("혼합 선두 메시지 처리", test_compaction_mixed_leading_messages(agent))
     await run_test("Identity 과잉 약속 방지", test_identity_no_overpromise(agent))
+    await run_test("Ephemeral 세션 (디스크 미기록)", test_ephemeral_session(agent))
 
     # ── 라이브 테스트 (API 호출) ──
     if args.offline:

@@ -173,10 +173,14 @@ class Agent:
         """Stop all scheduled tasks."""
         await self._scheduler.stop()
 
+    # Session IDs matching these prefixes are ephemeral (no disk persistence)
+    _EPHEMERAL_PREFIXES = ("cron-", "heartbeat")
+
     def _get_session(self, session_id: str = "default") -> SessionManager:
         if session_id not in self._sessions:
             session_dir = self.config.session.resolved_dir
-            self._sessions[session_id] = SessionManager(session_dir, session_id)
+            ephemeral = session_id.startswith(self._EPHEMERAL_PREFIXES)
+            self._sessions[session_id] = SessionManager(session_dir, session_id, ephemeral=ephemeral)
         return self._sessions[session_id]
 
     def _get_memory_searcher(self) -> MemorySearcher | None:
@@ -537,7 +541,7 @@ class Agent:
                     try:
                         result = await agent_ref.run(
                             prompt,
-                            session_id=f"cron-{_name}-{int(_time.time())}",
+                            session_id=f"cron-{_name}",
                         )
                         text = result.text or ""
                         if text.strip().upper() != "NO_REPLY":

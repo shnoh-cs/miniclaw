@@ -225,7 +225,7 @@ async def heartbeat_from_file(
         try:
             result = await agent.run(
                 prompt,
-                session_id=f"heartbeat-{int(time.time())}",
+                session_id="heartbeat",
             )
             text = result.text or ""
             if text.strip().upper() != "NO_REPLY":

@@ -134,11 +134,14 @@ class SessionManager:
     """Manages a single session as an append-only JSONL file.
 
     Each line is either an AgentMessage or a CompactionEntry.
+    Set ``ephemeral=True`` to keep the session in memory only (no disk I/O).
+    Useful for cron / heartbeat runs that don't need persistence.
     """
 
-    def __init__(self, session_dir: Path, session_id: str) -> None:
+    def __init__(self, session_dir: Path, session_id: str, *, ephemeral: bool = False) -> None:
         self.session_dir = session_dir
         self.session_id = session_id
+        self.ephemeral = ephemeral
         self.file_path = session_dir / f"{session_id}.jsonl"
         self.lock_path = session_dir / f".{session_id}.lock"
         self.messages: list[AgentMessage] = []
@@ -152,7 +155,7 @@ class SessionManager:
         self.messages.clear()
         self.compaction_entries.clear()
 
-        if not self.file_path.exists():
+        if self.ephemeral or not self.file_path.exists():
             self._loaded = True
             return
 
@@ -229,6 +232,8 @@ class SessionManager:
         }
 
     def _write_entry(self, data: dict[str, Any]) -> None:
+        if self.ephemeral:
+            return
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.file_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
@@ -237,6 +242,8 @@ class SessionManager:
 
     def _rewrite(self) -> None:
         """Rewrite the entire session file (after compaction)."""
+        if self.ephemeral:
+            return
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.file_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
