@@ -208,7 +208,8 @@ class MemorySearcher:
                 chunks.append((i + 1, end, chunk_text))
 
             overlap_lines = max(1, overlap // 50)
-            i = end - overlap_lines if end < len(lines) else len(lines)
+            next_i = end - overlap_lines if end < len(lines) else len(lines)
+            i = max(i + 1, next_i)  # always advance at least 1 line
 
         if not chunks:
             return 0
@@ -298,7 +299,8 @@ class MemorySearcher:
                 raw_chunks.append((i + 1, end, chunk_text))
 
             overlap_lines = max(1, overlap // 50)
-            i = end - overlap_lines if end < len(lines) else len(lines)
+            next_i = end - overlap_lines if end < len(lines) else len(lines)
+            i = max(i + 1, next_i)  # always advance at least 1 line
 
         if not raw_chunks:
             return 0

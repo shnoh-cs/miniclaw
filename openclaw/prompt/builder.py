@@ -262,6 +262,8 @@ def build_system_prompt(
             )
         ctx_lines.append("")
 
+        from openclaw.prompt.sanitize import sanitize_text, escape_html_in_untrusted
+
         for bf in bootstrap_ctx.files:
             ctx_lines.append(f"## {bf.name}")
             if bf.truncated:
@@ -269,7 +271,7 @@ def build_system_prompt(
                     f"*(truncated from {bf.original_size} chars)*"
                 )
             ctx_lines.append("")
-            ctx_lines.append(bf.content)
+            ctx_lines.append(escape_html_in_untrusted(sanitize_text(bf.content)))
             ctx_lines.append("")
 
         sections.append("\n".join(ctx_lines))

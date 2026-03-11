@@ -173,5 +173,5 @@ def build_fts_query(raw: str) -> str | None:
     tokens = [t.strip() for t in tokens if t.strip()]
     if not tokens:
         return None
-    quoted = ['"' + t.replace('"', "") + '"' for t in tokens]
+    quoted = ['"' + t.replace('"', '""') + '"' for t in tokens]
     return " AND ".join(quoted)

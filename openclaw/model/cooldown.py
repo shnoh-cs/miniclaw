@@ -70,8 +70,8 @@ class ProfileCooldown:
         return False
 
     def reset_if_stale(self, stale_hours: int = 24) -> None:
-        """Reset counters if last success was recent enough."""
-        if self.last_success and (time.time() - self.last_success) < stale_hours * 3600:
+        """Reset counters if no failure has occurred for *stale_hours*."""
+        if self.last_failure_at and (time.time() - self.last_failure_at) > stale_hours * 3600:
             self.error_count = 0
             self.billing_error_count = 0
 

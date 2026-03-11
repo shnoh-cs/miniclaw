@@ -74,19 +74,29 @@ class ScheduledTask:
 
 
 def _seconds_until_next_cron(expr: str, tz_name: str) -> float:
-    """Calculate seconds until the next cron expression match."""
+    """Calculate seconds until the next cron expression match.
+
+    Uses UTC epoch comparison to avoid DST transition bugs.
+    """
     from croniter import croniter
     import pytz
 
     if tz_name:
-        tz = pytz.timezone(tz_name)
+        try:
+            tz = pytz.timezone(tz_name)
+        except pytz.exceptions.UnknownTimeZoneError:
+            logger.warning("Unknown timezone '%s', using UTC", tz_name)
+            tz = pytz.UTC
         now = datetime.now(tz)
     else:
         now = datetime.now().astimezone()
 
     cron = croniter(expr, now)
     next_dt = cron.get_next(datetime)
-    delta = (next_dt - now).total_seconds()
+    # Compare in UTC to avoid DST issues
+    now_utc = now.astimezone(dt_timezone.utc)
+    next_utc = next_dt.astimezone(dt_timezone.utc)
+    delta = (next_utc - now_utc).total_seconds()
     return max(delta, 1.0)  # at least 1 second
 
 

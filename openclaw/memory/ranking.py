@@ -191,7 +191,7 @@ def apply_temporal_decay(
         if "MEMORY.md" in fp:
             continue
 
-        age_days = (now - result.chunk.updated_at) / 86400.0
+        age_days = max(0.0, (now - result.chunk.updated_at) / 86400.0)
         if age_days > 0:
             decay = math.exp(-decay_lambda * age_days)
             result.final_score *= decay

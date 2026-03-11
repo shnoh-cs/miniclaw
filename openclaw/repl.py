@@ -86,7 +86,7 @@ def main() -> None:
                     for s in status:
                         console.print(
                             f"[dim]{s['name']}: {s['status']} "
-                            f"(interval={s['interval']}s, runs={s['run_count']})[/dim]"
+                            f"({s['schedule']}, runs={s['run_count']})[/dim]"
                         )
                 continue
 

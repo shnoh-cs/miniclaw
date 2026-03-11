@@ -280,11 +280,13 @@ class ModelProvider:
                             "arguments": json.dumps(tu.input),
                         },
                     })
-                return {
+                result_msg: dict[str, Any] = {
                     "role": "assistant",
-                    "content": msg.text or None,
                     "tool_calls": tool_calls,
                 }
+                if msg.text:
+                    result_msg["content"] = msg.text
+                return result_msg
             return {"role": "assistant", "content": msg.text}
 
         return None

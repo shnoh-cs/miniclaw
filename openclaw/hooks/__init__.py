@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from typing import Any
 
 from openclaw.config import HooksConfig
@@ -58,7 +59,8 @@ class HookRunner:
             return
 
         try:
-            command = command_template.format(**kwargs)
+            safe_kwargs = {k: shlex.quote(str(v)) for k, v in kwargs.items()}
+            command = command_template.format(**safe_kwargs)
         except (KeyError, IndexError, ValueError) as exc:
             logger.warning("Hook %s: failed to format command: %s", event_name, exc)
             return

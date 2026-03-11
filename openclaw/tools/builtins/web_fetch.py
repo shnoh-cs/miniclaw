@@ -23,6 +23,14 @@ async def execute(args: dict[str, Any], **_: Any) -> ToolResult:
     if not url:
         return ToolResult(tool_use_id="", content="Error: url is required", is_error=True)
 
+    from urllib.parse import urlparse
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https"):
+        return ToolResult(
+            tool_use_id="", content=f"Error: Only HTTP(S) URLs allowed, got '{parsed_url.scheme}'",
+            is_error=True,
+        )
+
     try:
         import httpx
         from bs4 import BeautifulSoup
