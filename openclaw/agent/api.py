@@ -317,8 +317,11 @@ class Agent:
                 file_path = memory_dir / file_name
                 with open(file_path, "a", encoding="utf-8") as f:
                     f.write(f"\n{content}\n")
-                # Re-index the file
-                await searcher.index_file(file_path)
+                # Re-index the file (skip if no embedding provider)
+                try:
+                    await searcher.index_file(file_path)
+                except Exception:
+                    pass  # file saved even if indexing fails
                 # Register with FileWatcher for future change detection
                 if searcher.file_watcher:
                     searcher.file_watcher.register(file_path)
