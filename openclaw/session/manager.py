@@ -251,13 +251,44 @@ class SessionManager:
     def _repair_tool_pairing(self) -> None:
         """Repair tool_use / tool_result pairing mismatches.
 
-        Ensures every tool_use in an assistant message has a corresponding
-        tool_result in the next user message.
+        1. Forward: ensures every tool_use in an assistant message has a
+           corresponding tool_result in the next user message.
+        2. Backward: removes orphan tool_results in user messages that have
+           no preceding assistant message with matching tool_use.
         """
         if len(self.messages) < 2:
             return
 
         repaired = False
+
+        # Collect all tool_use IDs from assistant messages
+        all_tool_use_ids: set[str] = set()
+        for msg in self.messages:
+            if msg.role == "assistant":
+                for tu in msg.tool_uses:
+                    all_tool_use_ids.add(tu.id)
+
+        # Backward repair: remove orphan tool_results
+        for msg in self.messages:
+            if msg.role != "user":
+                continue
+            orphans = [
+                b for b in msg.content
+                if isinstance(b, ToolResultBlock) and b.tool_use_id not in all_tool_use_ids
+            ]
+            if orphans:
+                msg.content = [
+                    b for b in msg.content
+                    if not (isinstance(b, ToolResultBlock) and b.tool_use_id not in all_tool_use_ids)
+                ]
+                repaired = True
+
+        # Remove empty user messages left after orphan removal
+        self.messages = [
+            m for m in self.messages if m.content
+        ]
+
+        # Forward repair: add missing tool_results
         for i in range(len(self.messages) - 1):
             msg = self.messages[i]
             if msg.role != "assistant":

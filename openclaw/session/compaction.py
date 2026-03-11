@@ -280,6 +280,60 @@ def _compute_keep_count(
 
 
 # ---------------------------------------------------------------------------
+# Orphan tool result cleanup
+# ---------------------------------------------------------------------------
+
+
+def _strip_leading_orphan_tool_results(
+    messages: list[AgentMessage],
+) -> list[AgentMessage]:
+    """Remove orphan tool_results at the start of the kept message window.
+
+    After compaction slices messages[-keep_count:], the first message may be
+    a user message containing tool_results whose preceding assistant message
+    (with matching tool_use) was discarded.  This violates the API invariant
+    that every tool result must follow a tool_calls message.
+
+    We strip tool_result blocks from leading user messages until we hit a
+    message that has non-tool-result content or an assistant message.
+    """
+    from openclaw.agent.types import ToolResultBlock
+
+    cleaned: list[AgentMessage] = []
+    found_anchor = False
+
+    for msg in messages:
+        if found_anchor:
+            cleaned.append(msg)
+            continue
+
+        # Once we find an assistant message, everything from here is safe
+        if msg.role == "assistant":
+            found_anchor = True
+            cleaned.append(msg)
+            continue
+
+        # User message — check for orphan tool_results
+        non_tool_blocks = [
+            b for b in msg.content if not isinstance(b, ToolResultBlock)
+        ]
+
+        if non_tool_blocks:
+            # Has real text content — keep non-tool blocks, drop tool_results
+            msg.content = non_tool_blocks
+            found_anchor = True
+            cleaned.append(msg)
+        else:
+            # Entire message is tool_results with no anchor — drop it
+            log.debug(
+                "Stripped orphan tool_result message (id=%s) after compaction",
+                msg.id,
+            )
+
+    return cleaned if cleaned else messages
+
+
+# ---------------------------------------------------------------------------
 # Main compaction flow
 # ---------------------------------------------------------------------------
 
@@ -372,6 +426,11 @@ async def compact_session(
     )
 
     kept_messages = messages[-keep_count:]
+
+    # Ensure the first kept message doesn't have orphan tool_results
+    # (i.e. tool_results whose preceding assistant tool_use was discarded)
+    kept_messages = _strip_leading_orphan_tool_results(kept_messages)
+
     session.compaction_entries.append(entry)
     session.messages = kept_messages
     session._rewrite()
