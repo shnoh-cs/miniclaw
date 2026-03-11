@@ -1476,6 +1476,110 @@ async def test_ephemeral_session(agent) -> tuple[bool, str]:
     return ok, f"no_file={not file_exists}, in_memory={in_memory}, persistent_ok={persistent_exists}"
 
 
+async def test_browser_tool_registered(agent) -> tuple[bool, str]:
+    """Browser 도구 등록 및 BrowserManager 기본 동작 검증."""
+    # 1. Tool registered?
+    registered = agent.tool_registry.get("browser") is not None
+
+    # 2. BrowserManager can launch, navigate, snapshot, close
+    from openclaw.browser import BrowserManager, _format_snapshot
+
+    bm = BrowserManager(headless=True)
+    try:
+        # Navigate to a simple data URL
+        nav_result = await bm.execute(
+            "navigate", url="data:text/html,<html><head><title>Test</title></head>"
+            "<body><h1>Hello</h1><a href='https://example.com'>Link</a>"
+            "<input placeholder='Name'><button>Go</button></body></html>"
+        )
+        # data: URLs are blocked by SSRF protection — use about:blank + evaluate instead
+        if nav_result.startswith("Error"):
+            # Fall back: navigate to about:blank and inject HTML
+            await bm._ensure()
+            await bm._page.set_content(
+                "<h1>Hello</h1><a href='https://example.com'>Link</a>"
+                "<input placeholder='Name'><button>Go</button>"
+            )
+            nav_ok = True
+        else:
+            nav_ok = "Test" in nav_result or "Navigated" in nav_result
+
+        # Snapshot
+        snap_result = await bm.execute("snapshot")
+        has_refs = "[1]" in snap_result or "[2]" in snap_result
+        has_link = "link" in snap_result.lower()
+        has_button = "button" in snap_result.lower()
+
+        # Tab list
+        tab_result = await bm.execute("tab_list")
+        has_tab = "Tab 0" in tab_result
+
+        # Close
+        close_result = await bm.execute("close")
+        closed = "closed" in close_result.lower()
+
+    except Exception as e:
+        return False, f"BrowserManager error: {e}"
+
+    ok = registered and has_refs and has_link and has_button and has_tab and closed
+    return ok, (
+        f"registered={registered}, refs={has_refs}, link={has_link}, "
+        f"button={has_button}, tabs={has_tab}, closed={closed}"
+    )
+
+
+async def test_browser_snapshot_and_interact(agent) -> tuple[bool, str]:
+    """Browser 스냅샷 ref 기반 click/type 상호작용 검증."""
+    from openclaw.browser import BrowserManager
+
+    bm = BrowserManager(headless=True)
+    try:
+        await bm._ensure()
+
+        # Set up a form page
+        await bm._page.set_content("""
+            <form id="myform">
+                <input id="name" placeholder="Enter name" />
+                <input id="email" placeholder="Enter email" />
+                <button type="submit" onclick="event.preventDefault(); document.title='Submitted '+document.getElementById('name').value">Submit</button>
+            </form>
+        """)
+
+        # Snapshot — should see 3 interactive elements
+        snap = await bm.execute("snapshot")
+        ref_count_line = [l for l in snap.split("\n") if "Interactive elements:" in l]
+        ref_count = int(ref_count_line[0].split(":")[1].strip()) if ref_count_line else 0
+
+        # Type into first textbox (ref 1)
+        type_result = await bm.execute("type", ref=1, text="Alice")
+        typed_ok = "Alice" in type_result
+
+        # Fill form (refs 1 and 2)
+        fill_result = await bm.execute("fill_form", fields={"1": "Bob", "2": "bob@test.com"})
+        filled_ok = "2 fields" in fill_result
+
+        # Verify values via JS
+        name_val = await bm._page.evaluate("document.getElementById('name').value")
+        email_val = await bm._page.evaluate("document.getElementById('email').value")
+        values_ok = name_val == "Bob" and email_val == "bob@test.com"
+
+        # Click submit button (ref 3)
+        click_result = await bm.execute("click", ref=3)
+        title = await bm._page.title()
+        click_ok = "Submitted Bob" in title
+
+        await bm.close()
+
+    except Exception as e:
+        return False, f"error: {e}"
+
+    ok = ref_count >= 3 and typed_ok and filled_ok and values_ok and click_ok
+    return ok, (
+        f"refs={ref_count}, typed={typed_ok}, filled={filled_ok}, "
+        f"values={values_ok}, clicked={click_ok}"
+    )
+
+
 # ── 메인 ─────────────────────────────────────────────────
 
 
@@ -1570,6 +1674,8 @@ async def main() -> None:
     await run_test("Identity 과잉 약속 방지", test_identity_no_overpromise(agent))
     await run_test("cron expression 스케줄링", test_cron_expr_schedule(agent))
     await run_test("Ephemeral 세션 (디스크 미기록)", test_ephemeral_session(agent))
+    await run_test("Browser 도구 등록/기본동작", test_browser_tool_registered(agent))
+    await run_test("Browser 스냅샷/상호작용", test_browser_snapshot_and_interact(agent))
 
     # ── 라이브 테스트 (API 호출) ──
     if args.offline:

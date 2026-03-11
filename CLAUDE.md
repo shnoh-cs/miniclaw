@@ -12,16 +12,16 @@ OpenClaw Agent Harness의 Python 포트. 원본의 모든 "지능(intelligence)"
 
 - Python 3.11+, 가상환경: `.venv/`
 - 빌드: hatchling
-- 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile, croniter, python-dateutil
+- 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile, croniter, python-dateutil, playwright
 - 설정: `config.toml` (gitignore됨) / `config.example.toml` (vLLM 예시)
-- 총 소스: ~5,900줄 코어 + ~1,400줄 builtins (61개 모듈)
+- 총 소스: ~6,500줄 코어 + ~1,500줄 builtins (63개 모듈)
 
 ## 디렉토리 구조
 
 ```
 openclaw/
 ├── agent/          # Agent API, 에이전트 루프, 타입 정의
-│   ├── api.py           850줄  Agent 클래스 (Python API 진입점)
+│   ├── api.py           877줄  Agent 클래스 (Python API 진입점)
 │   ├── loop.py          685줄  메인 루프 (run → attempt → stream → tool dispatch)
 │   └── types.py         288줄  AgentMessage, ToolDefinition, RunResult 등
 ├── model/          # LLM 프로바이더, 페일오버
@@ -53,12 +53,14 @@ openclaw/
 │   ├── builder.py       333줄  13-섹션 프롬프트 조립 (부트스트랩 파일 소독)
 │   ├── bootstrap.py     138줄  부트스트랩 파일 8종 로딩
 │   └── sanitize.py      406줄  인젝션 방어 (13종 패턴·호모글리프·경계마커)
-├── tools/          # 도구 레지스트리·13개 내장 도구
+├── browser/        # Playwright 브라우저 자동화
+│   └── __init__.py      549줄  BrowserManager (스냅샷·ref·클릭·타이핑·멀티탭)
+├── tools/          # 도구 레지스트리·14개 내장 도구
 │   ├── registry.py       88줄  ToolRegistry·RegisteredTool
 │   ├── loop_detector.py 401줄  4종 루프 감지 (repeat·poll·ping-pong·breaker)
 │   ├── truncation.py    130줄  도구 결과 트렁케이션·세션 가드
-│   └── builtins/       1410줄  Read, Write, Edit, ApplyPatch, Bash, Process,
-│                                WebFetch, PDF, Hancom, Image, Memory(3), Cron, SessionStatus
+│   └── builtins/       1532줄  Read, Write, Edit, ApplyPatch, Bash, Process,
+│                                WebFetch, PDF, Hancom, Image, Memory(3), Cron, SessionStatus, Browser
 ├── skills/         # 스킬 디스커버리
 │   ├── loader.py        207줄  YAML frontmatter, OS/바이너리 게이팅, 번들 스킬 자동 로드
 │   └── bundled/         번들 스킬 (nano-pdf, himalaya)
@@ -123,8 +125,8 @@ openclaw/
 
 ## 테스트
 
-### `tests/test_live.py` — 56개 테스트
-- 오프라인 14개: ContextGuard, ToolRegistry, SessionLanes, Cron, Hook, 인젝션 방어, ThinkingLevel, 세션 영속성, 트렁케이션, 루프 감지, ApplyPatch, Failover, Cron Expression, Ephemeral Session
+### `tests/test_live.py` — 58개 테스트
+- 오프라인 16개: ContextGuard, ToolRegistry, SessionLanes, Cron, Hook, 인젝션 방어, ThinkingLevel, 세션 영속성, 트렁케이션, 루프 감지, ApplyPatch, Failover, Cron Expression, Ephemeral Session, Browser 등록/기본동작, Browser 스냅샷/상호작용
 - 배관 공사 13개: memory_get, 플러시, Thinking API, FileWatcher, subagent_batch, AgentContext, 프루닝, 체크포인트, heartbeat, compact_session, prompt builder, flush 안전마진
 - 지능 갭 7개: 플러시 에이전트 루프, auto_recall, 체크포인트 복원, 컨텍스트 진단, 큐레이션, 진단 자동 조정, auto-recall 스코프
 - 라이브 13개: 대화, Read, Bash, Write→Read, 다중 턴, WebFetch, Edit, 커스텀 도구, 스트리밍, 에러 처리, 한국어, 긴 출력, 수학 추론
@@ -136,7 +138,7 @@ cd ~/miniclaw
 source .venv/bin/activate
 pip install -e .
 openclaw-py              # 대화형 REPL
-python tests/test_live.py [--offline]  # 테스트 (56개, --offline: 오프라인만)
+python tests/test_live.py [--offline]  # 테스트 (58개, --offline: 오프라인만)
 ```
 
 ## 주의사항

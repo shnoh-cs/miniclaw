@@ -11,7 +11,7 @@
 |------|------|
 | **Agent Python API** | `Agent.from_config()` → `agent.run()` / `agent.stream()` |
 | **듀얼 툴 콜링** | 네이티브 function calling + `<tool_call>` XML 프롬프트 자동 전환 |
-| **13개 내장 도구** | Read, Write, Edit, ApplyPatch, Bash, Process, WebFetch, PDF, Hancom, Image, Memory(3), Cron, SessionStatus |
+| **14개 내장 도구** | Read, Write, Edit, ApplyPatch, Bash, Process, WebFetch, PDF, Hancom, Image, Memory(3), Cron, SessionStatus, Browser |
 | **다단계 컴팩션** | split→summarize→merge로 장시간 대화에서도 맥락 유지 |
 | **하이브리드 메모리** | BM25 + 벡터 코사인 + MMR 다양성 + 시간 감쇠 (30일 반감기) |
 | **메모리 큐레이션** | 임베딩 기반 반복 패턴 탐지 → MEMORY.md 자동 승격 |
@@ -23,6 +23,7 @@
 | **루프 감지** | 4종 감지기 (repeat, circuit breaker, poll, ping-pong) |
 | **Thinking 레벨** | off→minimal→low→medium→high→xhigh + 자동 폴백 체인 |
 | **Hook 시스템** | pre/post tool_call, pre/post message, on_error |
+| **브라우저 자동화** | Playwright 기반 풀 브라우저 제어 (스냅샷·ref 클릭·타이핑·폼·멀티탭·스크린샷) |
 | **Cron/Heartbeat** | 3종 스케줄(every/cron/at), 에페머럴 세션, HEARTBEAT.md 에이전트 루프 실행 |
 | **서브에이전트** | 깊이 제한(max 5), 독립 세션, 배치 동시 실행 (Semaphore 3) |
 | **스킬 시스템** | YAML frontmatter, OS/바이너리 게이팅 |
@@ -175,7 +176,7 @@ timeout = 10
 │  │  Agent Loop (agent/loop.py)                        │  │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │  │
 │  │  │ Context  │→│  Model   │→│  Tool Registry   │ │  │
-│  │  │  Guard   │  │ Provider │  │  (13 built-in)   │ │  │
+│  │  │  Guard   │  │ Provider │  │  (14 built-in)   │ │  │
 │  │  └──────────┘  └──────────┘  └──────────────────┘ │  │
 │  │       │            │              │                │  │
 │  │       ▼            ▼              ▼                │  │
@@ -253,7 +254,7 @@ REPL에서 `/context` 명령으로 진단 보고서 확인 가능.
 ## 테스트
 
 ```bash
-# 전체 테스트 (56개: 오프라인 43 + 라이브 13)
+# 전체 테스트 (58개: 오프라인 45 + 라이브 13)
 python tests/test_live.py
 
 # 오프라인만
@@ -268,7 +269,7 @@ python tests/eval/eval_parity.py
 
 ### 테스트 구성 (`tests/test_live.py`)
 
-#### 1. 단위 테스트 — 오프라인 14개
+#### 1. 단위 테스트 — 오프라인 16개
 | 테스트 | 검증 내용 |
 |--------|-----------|
 | ContextGuard | 토큰 예산 → OK/COMPACT 에스컬레이션 |
@@ -285,6 +286,8 @@ python tests/eval/eval_parity.py
 | 도구 루프 감지 | N회 반복 경고 |
 | ApplyPatch | 패치 도구 등록 확인 |
 | Failover 설정 | 폴백 체인 구성 |
+| Browser 등록/기본동작 | Playwright 도구 등록·스냅샷·탭 관리 |
+| Browser 스냅샷/상호작용 | ref 기반 click·type·fill_form 검증 |
 
 #### 2. 배관 공사 검증 — 오프라인 13개
 memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subagent_batch, AgentContext.memory_searcher, prunable_tools, 컴팩션 체크포인트, heartbeat_from_file, compact_session, prompt builder, flush 안전마진
@@ -298,7 +301,7 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 ### 테스트 결과 (2026-03-11)
 
 ```
-오프라인 43개: ALL PASS
+오프라인 45개: ALL PASS
 라이브 13개: 11/13 PASS (Read 도구, 에러 처리 — LLM 응답 비결정성으로 간헐적 실패)
 ```
 
@@ -801,7 +804,7 @@ memory_get 등록·실행, 메모리 플러시, Thinking API, FileWatcher, subag
 
 ```
 miniclaw/
-├── openclaw/               # 메인 패키지 (~5,900줄 코어 + ~1,400줄 builtins, 61 모듈)
+├── openclaw/               # 메인 패키지 (~6,500줄 코어 + ~1,500줄 builtins, 63 모듈)
 │   ├── agent/              #   Agent API·에이전트 루프·타입
 │   │   ├── api.py          #     Agent 클래스 (진입점, 에페머럴 세션 자동 감지)
 │   │   ├── loop.py         #     메인 루프
@@ -825,12 +828,13 @@ miniclaw/
 │   │   ├── query.py        #     다국어 쿼리 토큰화·확장·FTS 빌더
 │   │   ├── watchers.py     #     FileWatcher·Reranker·SessionSyncWatcher
 │   │   └── ...             #     store, embeddings, curation
+│   ├── browser/            #   Playwright 브라우저 자동화 (스냅샷·ref·멀티탭)
 │   ├── prompt/             #   시스템 프롬프트·인젝션 방어 (부트스트랩 소독)
-│   ├── tools/              #   도구 레지스트리·13개 내장 도구
+│   ├── tools/              #   도구 레지스트리·14개 내장 도구
 │   │   ├── registry.py     #     ToolRegistry·RegisteredTool
 │   │   ├── loop_detector.py #    4종 루프 감지 (repeat·poll·ping-pong·breaker)
 │   │   ├── truncation.py   #     도구 결과 트렁케이션·세션 가드
-│   │   └── builtins/       #     13개 내장 도구 (+ Cron, SessionStatus)
+│   │   └── builtins/       #     14개 내장 도구 (+ Cron, SessionStatus, Browser)
 │   ├── skills/             #   스킬 디스커버리
 │   ├── subagent/           #   서브에이전트
 │   ├── hooks/              #   Hook 시스템 (shlex 인젝션 방어)
@@ -839,7 +843,7 @@ miniclaw/
 │   ├── tokenizer.py        #   tiktoken 토큰 추정
 │   └── repl.py             #   대화형 REPL
 ├── tests/                  # 테스트 & Eval Suites
-│   ├── test_live.py          # 통합 테스트 (56개: 오프라인 43 + 라이브 13)
+│   ├── test_live.py          # 통합 테스트 (58개: 오프라인 45 + 라이브 13)
 │   └── eval/
 │       ├── eval_intelligence.py  # Intelligence Eval (8개 시나리오)
 │       └── eval_parity.py        # Golden Parity Eval (8개 섹션)

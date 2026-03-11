@@ -106,9 +106,10 @@ class Agent:
         # Cron/heartbeat scheduler (must init before cron tool registration)
         self._scheduler = CronScheduler()
 
-        # Register cron + session_status tools (need agent/scheduler refs)
+        # Register cron + session_status + browser tools (need agent/scheduler refs)
         self._register_cron_tools()
         self._register_session_status_tool()
+        self._register_browser_tool()
 
         # Memory
         self._memory_store: MemoryStore | None = None
@@ -711,6 +712,32 @@ class Agent:
             return ToolResult(tool_use_id="", content="\n".join(lines))
 
         self.tool_registry.register(status_def, status_executor, group="status")
+
+    def _register_browser_tool(self) -> None:
+        """Register browser tool — Playwright-based web interaction."""
+        from openclaw.tools.builtins.browser_tool import DEFINITION as browser_def
+
+        agent_ref = self
+
+        async def browser_executor(args: dict[str, Any]) -> ToolResult:
+            # Lazy-init BrowserManager on first use
+            if not hasattr(agent_ref, "_browser_manager") or agent_ref._browser_manager is None:
+                from openclaw.browser import BrowserManager
+                agent_ref._browser_manager = BrowserManager()
+
+            action = (args.get("action") or "").strip().lower()
+            if not action:
+                return ToolResult(
+                    tool_use_id="", content="Error: 'action' parameter is required.",
+                    is_error=True,
+                )
+
+            # Pass all args to the manager (it picks what it needs)
+            result = await agent_ref._browser_manager.execute(action, **args)
+            is_err = result.startswith("Error")
+            return ToolResult(tool_use_id="", content=result, is_error=is_err)
+
+        self.tool_registry.register(browser_def, browser_executor, group="web")
 
     async def _initial_memory_index(self) -> None:
         """Index existing memory files on first run."""
