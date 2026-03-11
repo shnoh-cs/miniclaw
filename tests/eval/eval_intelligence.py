@@ -199,6 +199,7 @@ async def eval_compaction_survival() -> tuple[float, str]:
     # 4. 올바른 섹션이 있는 요약은 통과하는지
     good_summary = (
         "## Decisions\nUsed API endpoint for deployment.\n"
+        "## Completed work\nDeployment script written and tested.\n"
         "## Open TODOs\nFinalize config.\n"
         "## Constraints\nMust use internal network.\n"
         "## Pending user asks\nNone.\n"

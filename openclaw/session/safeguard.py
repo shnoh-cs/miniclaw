@@ -28,6 +28,7 @@ MIN_ASK_OVERLAP_TOKENS_FOR_DOUBLE_MATCH = 3
 # Required sections in a safeguard-validated summary (order matters)
 _REQUIRED_SECTIONS = [
     "## Decisions",
+    "## Completed work",
     "## Open TODOs",
     "## Constraints",
     "## Pending user asks",

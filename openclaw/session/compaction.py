@@ -55,8 +55,10 @@ MERGE_SUMMARIES_INSTRUCTIONS = "\n".join([
     "Merge these partial summaries into a single cohesive summary.",
     "",
     "MUST PRESERVE:",
+    "- Completed work and their outputs (files created, results delivered)",
     "- Active tasks and their current status (in-progress, blocked, pending)",
-    "- Batch operation progress (e.g., '5/17 items completed')",
+    "- Batch operation progress — use the LATEST count (e.g., if an earlier summary",
+    "  says '3/17 done' but a later one shows all 17 finished, write '17/17 done')",
     "- The last thing the user requested and what was being done about it",
     "- Decisions made and their rationale",
     "- TODOs, open questions, and constraints",
@@ -64,6 +66,8 @@ MERGE_SUMMARIES_INSTRUCTIONS = "\n".join([
     "",
     "PRIORITIZE recent context over older history. The agent needs to know",
     "what it was doing, not just what was discussed.",
+    "When a previous summary says a task is in-progress but later messages show",
+    "it was completed, mark it as COMPLETED — not still in-progress.",
 ])
 
 MAX_LLM_RETRIES = 3
@@ -152,7 +156,10 @@ def _build_summarization_prompt(
         "Preserve the most important information for continuing the work.\n\n"
         "Produce a compact, factual summary with these exact section headings:\n"
         "## Decisions\nKey decisions made.\n"
-        "## Open TODOs\nTasks that are still pending.\n"
+        "## Completed work\nTasks finished and their outputs (files created, results delivered). "
+        "Update progress counts to reflect the LATEST state — if a previous summary says "
+        "'3/10 done' but the conversation shows all 10 finished, write '10/10 done'.\n"
+        "## Open TODOs\nTasks that are still pending. Remove items that were completed.\n"
         "## Constraints\nRules or constraints discovered.\n"
         "## Pending user asks\nRequests from the user not yet addressed.\n"
         "## Exact identifiers\nCritical IDs, hashes, URLs, file paths.\n"
