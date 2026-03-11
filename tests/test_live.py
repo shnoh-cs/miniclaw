@@ -1401,6 +1401,53 @@ async def test_identity_no_overpromise(agent) -> tuple[bool, str]:
     return ok, f"concise_identity={ok}, bullets={identity.count('- **')}"
 
 
+async def test_cron_expr_schedule(agent) -> tuple[bool, str]:
+    """cron expression 스케줄링이 올바르게 등록되는지 검증."""
+    executor = agent.tool_registry.get("cron")
+    executor = executor.executor if executor else None
+    if not executor:
+        return False, "cron not registered"
+
+    # Create with cron expression
+    result = await executor({
+        "action": "create",
+        "name": "test_cron_expr_job",
+        "cron_expr": "0 7,19 * * *",
+        "timezone": "Asia/Seoul",
+        "task": "generate daily report",
+    })
+    created = not result.is_error and "cron '0 7,19 * * *'" in result.content
+
+    # Verify schedule in status
+    result = await executor({"action": "status", "name": "test_cron_expr_job"})
+    has_cron = not result.is_error and "0 7,19 * * *" in result.content
+
+    # Invalid cron expression should fail
+    result = await executor({
+        "action": "create",
+        "name": "bad_cron",
+        "cron_expr": "invalid cron",
+        "task": "test",
+    })
+    invalid_rejected = result.is_error
+
+    # Create with "at" (absolute time)
+    result = await executor({
+        "action": "create",
+        "name": "test_at_job",
+        "at": "2099-12-31T23:59:59+09:00",
+        "task": "future task",
+    })
+    at_created = not result.is_error and "at 2099" in result.content
+
+    # Cleanup
+    await executor({"action": "delete", "name": "test_cron_expr_job"})
+    await executor({"action": "delete", "name": "test_at_job"})
+
+    ok = created and has_cron and invalid_rejected and at_created
+    return ok, f"cron={created}, status={has_cron}, invalid_rejected={invalid_rejected}, at={at_created}"
+
+
 async def test_ephemeral_session(agent) -> tuple[bool, str]:
     """Ephemeral 세션이 디스크에 기록되지 않는지 검증."""
     from openclaw.session.manager import SessionManager
@@ -1521,6 +1568,7 @@ async def main() -> None:
     await run_test("cron 생성/조회/삭제", test_cron_tool_create_delete(agent))
     await run_test("혼합 선두 메시지 처리", test_compaction_mixed_leading_messages(agent))
     await run_test("Identity 과잉 약속 방지", test_identity_no_overpromise(agent))
+    await run_test("cron expression 스케줄링", test_cron_expr_schedule(agent))
     await run_test("Ephemeral 세션 (디스크 미기록)", test_ephemeral_session(agent))
 
     # ── 라이브 테스트 (API 호출) ──

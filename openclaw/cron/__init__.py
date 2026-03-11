@@ -1,9 +1,9 @@
 """Cron / heartbeat scheduler for periodic agent tasks.
 
-Supports:
-- Heartbeat: periodic health checks (model connectivity, memory index, etc.)
-- Scheduled tasks: cron-like jobs that run at intervals
-- One-shot timers: delayed execution of a single task
+Supports three schedule types (matching original OpenClaw):
+- "every": fixed interval (e.g., every 120 seconds)
+- "cron":  cron expression with timezone (e.g., "0 7,19 * * *" Asia/Seoul)
+- "at":    one-shot absolute time (e.g., "2026-03-12T07:00:00+09:00")
 
 All tasks run as asyncio background tasks and are non-blocking.
 Failures are logged but never crash the agent.
@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone as dt_timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine
 
@@ -29,13 +30,41 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ScheduleKind(str, Enum):
+    EVERY = "every"
+    CRON = "cron"
+    AT = "at"
+
+
+@dataclass
+class Schedule:
+    """Schedule specification for a task."""
+
+    kind: ScheduleKind
+    interval_seconds: float = 0.0       # for "every"
+    cron_expr: str = ""                  # for "cron"
+    timezone: str = ""                   # for "cron" (IANA, e.g. "Asia/Seoul")
+    at: str = ""                         # for "at" (ISO 8601)
+
+    @property
+    def description(self) -> str:
+        if self.kind == ScheduleKind.EVERY:
+            return f"every {self.interval_seconds}s"
+        if self.kind == ScheduleKind.CRON:
+            tz = f" ({self.timezone})" if self.timezone else ""
+            return f"cron '{self.cron_expr}'{tz}"
+        if self.kind == ScheduleKind.AT:
+            return f"at {self.at}"
+        return "unknown"
+
+
 @dataclass
 class ScheduledTask:
     """A single scheduled task."""
 
     name: str
     callback: Callable[..., Coroutine[Any, Any, None]]
-    interval_seconds: float
+    schedule: Schedule
     one_shot: bool = False
     status: TaskStatus = TaskStatus.PENDING
     last_run: float = 0.0
@@ -44,22 +73,57 @@ class ScheduledTask:
     _task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
+def _seconds_until_next_cron(expr: str, tz_name: str) -> float:
+    """Calculate seconds until the next cron expression match."""
+    from croniter import croniter
+    import pytz
+
+    if tz_name:
+        tz = pytz.timezone(tz_name)
+        now = datetime.now(tz)
+    else:
+        now = datetime.now().astimezone()
+
+    cron = croniter(expr, now)
+    next_dt = cron.get_next(datetime)
+    delta = (next_dt - now).total_seconds()
+    return max(delta, 1.0)  # at least 1 second
+
+
+def _seconds_until_at(at_str: str) -> float:
+    """Calculate seconds until an absolute timestamp."""
+    from dateutil import parser as dateutil_parser
+
+    target = dateutil_parser.parse(at_str)
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=dt_timezone.utc)
+    now = datetime.now(dt_timezone.utc)
+    delta = (target - now).total_seconds()
+    return max(delta, 0.0)
+
+
 class CronScheduler:
     """Lightweight async scheduler for periodic agent tasks.
 
     Usage:
         scheduler = CronScheduler()
 
-        # Register a heartbeat (runs every 60s)
-        scheduler.register("heartbeat", check_health, interval=60)
+        # Register with interval
+        scheduler.register("heartbeat", check_health,
+                           schedule=Schedule(kind=ScheduleKind.EVERY, interval_seconds=60))
 
-        # Register a one-shot timer
-        scheduler.register("cleanup", do_cleanup, interval=300, one_shot=True)
+        # Register with cron expression
+        scheduler.register("morning", morning_brief,
+                           schedule=Schedule(kind=ScheduleKind.CRON,
+                                            cron_expr="0 7 * * *", timezone="Asia/Seoul"))
 
-        # Start all tasks
+        # Register one-shot at absolute time
+        scheduler.register("reminder", remind,
+                           schedule=Schedule(kind=ScheduleKind.AT,
+                                            at="2026-03-12T07:00:00+09:00"),
+                           one_shot=True)
+
         await scheduler.start()
-
-        # Later...
         await scheduler.stop()
     """
 
@@ -71,14 +135,22 @@ class CronScheduler:
         self,
         name: str,
         callback: Callable[..., Coroutine[Any, Any, None]],
+        *,
+        schedule: Schedule | None = None,
         interval: float = 60.0,
         one_shot: bool = False,
     ) -> None:
-        """Register a new scheduled task."""
+        """Register a new scheduled task.
+
+        Either pass a ``Schedule`` object or a plain ``interval`` (seconds)
+        for backward compatibility with heartbeat registration.
+        """
+        if schedule is None:
+            schedule = Schedule(kind=ScheduleKind.EVERY, interval_seconds=interval)
         self._tasks[name] = ScheduledTask(
             name=name,
             callback=callback,
-            interval_seconds=interval,
+            schedule=schedule,
             one_shot=one_shot,
         )
 
@@ -103,8 +175,8 @@ class CronScheduler:
                 )
                 task.status = TaskStatus.RUNNING
                 logger.info(
-                    "Cron: started '%s' (interval=%ds, one_shot=%s)",
-                    name, task.interval_seconds, task.one_shot,
+                    "Cron: started '%s' (%s, one_shot=%s)",
+                    name, task.schedule.description, task.one_shot,
                 )
 
     async def stop(self) -> None:
@@ -115,7 +187,6 @@ class CronScheduler:
                 task._task.cancel()
                 task.status = TaskStatus.CANCELLED
 
-        # Wait for cancellation
         pending = [t._task for t in self._tasks.values() if t._task and not t._task.done()]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
@@ -128,7 +199,7 @@ class CronScheduler:
             {
                 "name": t.name,
                 "status": t.status.value,
-                "interval": t.interval_seconds,
+                "schedule": t.schedule.description,
                 "one_shot": t.one_shot,
                 "run_count": t.run_count,
                 "last_run": t.last_run,
@@ -141,7 +212,15 @@ class CronScheduler:
         """Internal loop for a single task."""
         try:
             while self._running:
-                await asyncio.sleep(task.interval_seconds)
+                # Calculate sleep duration based on schedule type
+                sleep_secs = self._next_sleep(task)
+                if sleep_secs < 0:
+                    # "at" schedule already passed
+                    task.status = TaskStatus.COMPLETED
+                    logger.info("Cron: '%s' target time already passed, skipping", task.name)
+                    break
+
+                await asyncio.sleep(sleep_secs)
 
                 if not self._running:
                     break
@@ -152,7 +231,7 @@ class CronScheduler:
                     task.run_count += 1
                     task.last_error = None
 
-                    if task.one_shot:
+                    if task.one_shot or task.schedule.kind == ScheduleKind.AT:
                         task.status = TaskStatus.COMPLETED
                         logger.info("Cron: one-shot '%s' completed", task.name)
                         break
@@ -162,12 +241,24 @@ class CronScheduler:
                     task.run_count += 1
                     logger.warning("Cron: '%s' failed: %s", task.name, exc)
 
-                    if task.one_shot:
+                    if task.one_shot or task.schedule.kind == ScheduleKind.AT:
                         task.status = TaskStatus.FAILED
                         break
 
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
+
+    def _next_sleep(self, task: ScheduledTask) -> float:
+        """Calculate seconds to sleep before next execution."""
+        sched = task.schedule
+        if sched.kind == ScheduleKind.EVERY:
+            return sched.interval_seconds
+        if sched.kind == ScheduleKind.CRON:
+            return _seconds_until_next_cron(sched.cron_expr, sched.timezone)
+        if sched.kind == ScheduleKind.AT:
+            secs = _seconds_until_at(sched.at)
+            return secs if secs > 0 else -1.0
+        return 60.0  # fallback
 
 
 # ---------------------------------------------------------------------------

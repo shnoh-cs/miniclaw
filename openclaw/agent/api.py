@@ -498,26 +498,23 @@ class Agent:
                 for j in jobs:
                     lines.append(
                         f"- {j['name']}: {j['status']} "
-                        f"(interval={j['interval']}s, runs={j['run_count']}, "
+                        f"({j['schedule']}, runs={j['run_count']}, "
                         f"one_shot={j['one_shot']})"
                     )
                 return ToolResult(tool_use_id="", content="\n".join(lines))
 
             elif action == "create":
                 name = args.get("name", "")
-                interval = args.get("interval_seconds")
                 task_desc = args.get("task", "")
+                cron_expr = args.get("cron_expr", "")
+                at_time = args.get("at", "")
+                interval = args.get("interval_seconds")
+                tz = args.get("timezone", "")
                 one_shot = bool(args.get("one_shot", False))
 
                 if not name:
                     return ToolResult(
                         tool_use_id="", content="Error: name is required for create",
-                        is_error=True,
-                    )
-                if not interval or int(interval) <= 0:
-                    return ToolResult(
-                        tool_use_id="",
-                        content="Error: interval_seconds must be a positive integer",
                         is_error=True,
                     )
                 if not task_desc:
@@ -526,7 +523,49 @@ class Agent:
                         is_error=True,
                     )
 
-                interval = int(interval)
+                # Build schedule from provided parameters
+                from openclaw.cron import Schedule, ScheduleKind
+
+                if cron_expr:
+                    # Validate cron expression
+                    try:
+                        from croniter import croniter
+                        croniter(cron_expr)
+                    except (ValueError, KeyError) as exc:
+                        return ToolResult(
+                            tool_use_id="",
+                            content=f"Error: invalid cron expression '{cron_expr}': {exc}",
+                            is_error=True,
+                        )
+                    schedule = Schedule(
+                        kind=ScheduleKind.CRON,
+                        cron_expr=cron_expr,
+                        timezone=tz,
+                    )
+                elif at_time:
+                    # Validate absolute time
+                    try:
+                        from dateutil import parser as dateutil_parser
+                        dateutil_parser.parse(at_time)
+                    except (ValueError, OverflowError) as exc:
+                        return ToolResult(
+                            tool_use_id="",
+                            content=f"Error: invalid timestamp '{at_time}': {exc}",
+                            is_error=True,
+                        )
+                    schedule = Schedule(kind=ScheduleKind.AT, at=at_time)
+                    one_shot = True  # "at" is always one-shot
+                elif interval and int(interval) > 0:
+                    schedule = Schedule(
+                        kind=ScheduleKind.EVERY,
+                        interval_seconds=float(int(interval)),
+                    )
+                else:
+                    return ToolResult(
+                        tool_use_id="",
+                        content="Error: provide cron_expr, at, or interval_seconds",
+                        is_error=True,
+                    )
 
                 # Build callback that runs task through the agent loop
                 async def _cron_callback(
@@ -554,7 +593,7 @@ class Agent:
                         scheduler.unregister(_name)
 
                 scheduler.register(
-                    name, _cron_callback, interval=interval, one_shot=one_shot,
+                    name, _cron_callback, schedule=schedule, one_shot=one_shot,
                 )
 
                 # Auto-start scheduler if not running
@@ -579,7 +618,7 @@ class Agent:
                 return ToolResult(
                     tool_use_id="",
                     content=(
-                        f"Created cron job '{name}': interval={interval}s, "
+                        f"Created cron job '{name}': {schedule.description}, "
                         f"one_shot={one_shot}\nTask: {task_desc}"
                     ),
                 )
@@ -617,7 +656,7 @@ class Agent:
                             content=(
                                 f"Job: {j['name']}\n"
                                 f"Status: {j['status']}\n"
-                                f"Interval: {j['interval']}s\n"
+                                f"Schedule: {j['schedule']}\n"
                                 f"One-shot: {j['one_shot']}\n"
                                 f"Run count: {j['run_count']}\n"
                                 f"Last error: {j['last_error'] or 'none'}"
