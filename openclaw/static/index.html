@@ -133,6 +133,8 @@ const cronPanel = document.getElementById('cronPanel');
 const cronList = document.getElementById('cronList');
 
 let sending = false;
+let pollTimer = null;
+let lastMessageCount = 0;
 
 // Auto-resize textarea
 inputEl.addEventListener('input', () => {
@@ -171,6 +173,10 @@ function addToolCall(name, args, status) {
   return el;
 }
 
+// ---------------------------------------------------------------------------
+// Send message (fire-and-forget) + poll for response
+// ---------------------------------------------------------------------------
+
 async function send() {
   if (sending) return;
   const text = inputEl.value.trim();
@@ -183,110 +189,103 @@ async function send() {
 
   addMessage('user', text);
 
-  // Create assistant message placeholder
-  const assistantEl = document.createElement('div');
-  assistantEl.className = 'msg assistant';
-  const cursor = document.createElement('span');
-  cursor.className = 'streaming-cursor';
-  assistantEl.appendChild(cursor);
-  messagesEl.appendChild(assistantEl);
+  // Show thinking indicator
+  const thinkingEl = document.createElement('div');
+  thinkingEl.className = 'msg assistant';
+  thinkingEl.innerHTML = '<span class="streaming-cursor"></span>';
+  messagesEl.appendChild(thinkingEl);
   scrollToBottom();
 
-  let fullText = '';
-  let currentToolEl = null;
-
   try {
-    const params = new URLSearchParams({action: 'chat', message: text, session_id: sessionEl.value});
-    const response = await fetch(`?${params}`);
+    // Fire-and-forget: send message to server
+    const params = new URLSearchParams({action: 'send', message: text, session_id: sessionEl.value});
+    const res = await fetch(`?${params}`);
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, {stream: true});
-
-      // Parse SSE events from buffer
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep incomplete line
-
-      let eventType = null;
-      let dataStr = '';
-
-      for (const line of lines) {
-        if (line.startsWith('event: ')) {
-          eventType = line.slice(7);
-        } else if (line.startsWith('data: ')) {
-          dataStr = line.slice(6);
-          if (eventType && dataStr) {
-            handleEvent(eventType, JSON.parse(dataStr), assistantEl, cursor);
-          }
-          eventType = null;
-          dataStr = '';
-        }
-        // Ignore comments (: keepalive) and empty lines
-      }
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      thinkingEl.remove();
+      addMessage('error', data.error || `Server error: ${res.status}`);
+      sending = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
+      return;
     }
+
+    // Poll for response
+    await pollForResponse(thinkingEl);
   } catch (err) {
+    thinkingEl.remove();
     addMessage('error', `Connection error: ${err.message}`);
   }
-
-  // Remove cursor
-  if (cursor.parentNode) cursor.remove();
-
-  // If assistant message is empty, remove it
-  if (!assistantEl.textContent.trim()) assistantEl.remove();
 
   sending = false;
   sendBtn.disabled = false;
   inputEl.focus();
 }
 
-function handleEvent(type, data, assistantEl, cursor) {
-  switch (type) {
-    case 'text':
-      // Insert text before cursor
-      cursor.before(data.text);
-      scrollToBottom();
-      break;
+async function pollForResponse(thinkingEl) {
+  const sid = sessionEl.value;
+  const startCount = lastMessageCount;
 
-    case 'tool_start':
-      addToolCall(data.name, data.args, 'running');
-      break;
+  // Poll every 1.5s until we get new messages and agent is done processing
+  for (let i = 0; i < 600; i++) {  // max ~15 minutes
+    await sleep(1500);
 
-    case 'tool_end': {
-      // Update the last running tool call
-      const tools = messagesEl.querySelectorAll('.tool-call.running');
-      const last = tools[tools.length - 1];
-      if (last) {
-        last.className = `tool-call ${data.ok ? 'ok' : 'err'}`;
-        last.textContent = `${data.ok ? '\u2713' : '\u2717'} ${data.name}: ${data.preview.slice(0, 80)}`;
+    try {
+      // Check status + history in parallel
+      const [statusRes, histRes] = await Promise.all([
+        fetch(`?action=status&session_id=${encodeURIComponent(sid)}`),
+        fetch(`?action=history&session_id=${encodeURIComponent(sid)}`),
+      ]);
+
+      const status = await statusRes.json();
+      const data = await histRes.json();
+
+      if (data.messages.length > lastMessageCount) {
+        // Remove thinking indicator
+        thinkingEl.remove();
+
+        // Show new messages
+        const newMsgs = data.messages.slice(lastMessageCount);
+        for (const msg of newMsgs) {
+          if (msg.role === 'user' && msg.text) {
+            // Skip — we already showed the user message locally
+          } else if (msg.role === 'assistant' && msg.text) {
+            addMessage('assistant', msg.text);
+          }
+          if (msg.tool_calls) {
+            for (const tc of msg.tool_calls) {
+              if (tc.name !== 'result') {
+                addToolCall(tc.name, tc.args || {}, 'ok');
+              }
+            }
+          }
+        }
+        lastMessageCount = data.messages.length;
+        scrollToBottom();
       }
-      break;
+
+      // Done when agent is no longer processing
+      if (!status.processing && data.messages.length > startCount) {
+        return;
+      }
+    } catch (e) {
+      // Ignore poll failures, keep trying
     }
-
-    case 'done':
-      if (data.compacted) {
-        const notice = document.createElement('div');
-        notice.className = 'notice';
-        notice.textContent = 'Session was compacted';
-        messagesEl.appendChild(notice);
-      }
-      if (data.error) {
-        addMessage('error', data.error);
-      }
-      break;
-
-    case 'error':
-      addMessage('error', data.error || 'Unknown error');
-      break;
   }
+
+  // Timeout
+  thinkingEl.remove();
+  addMessage('error', 'Response timeout');
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
 // Cron panel
+// ---------------------------------------------------------------------------
 function toggleCron() {
   cronPanel.classList.toggle('show');
   if (cronPanel.classList.contains('show')) refreshCron();
@@ -308,25 +307,18 @@ async function refreshCron() {
   }
 }
 
-// Refresh cron every 30s if panel is open
 setInterval(() => { if (cronPanel.classList.contains('show')) refreshCron(); }, 30000);
 
 // ---------------------------------------------------------------------------
 // Load previous messages on page load
 // ---------------------------------------------------------------------------
-let lastMessageCount = 0;
 
 async function loadHistory() {
   const sid = sessionEl.value;
   try {
     const res = await fetch(`?action=history&session_id=${encodeURIComponent(sid)}`);
-    console.log('History response:', res.status, res.headers.get('content-type'));
-    if (!res.ok || !res.headers.get('content-type')?.includes('json')) {
-      console.warn('History: unexpected response', await res.text().then(t => t.slice(0, 200)));
-      return;
-    }
+    if (!res.ok || !res.headers.get('content-type')?.includes('json')) return;
     const data = await res.json();
-    console.log('History loaded:', data.messages?.length, 'messages');
 
     messagesEl.innerHTML = '';
 
@@ -343,12 +335,9 @@ async function loadHistory() {
       } else if (msg.role === 'assistant' && msg.text) {
         addMessage('assistant', msg.text);
       }
-      // Tool calls from history shown as collapsed summary
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
-          if (tc.name === 'result') {
-            // skip tool results in history for cleanliness
-          } else {
+          if (tc.name !== 'result') {
             addToolCall(tc.name, tc.args || {}, 'ok');
           }
         }
@@ -362,28 +351,35 @@ async function loadHistory() {
   }
 }
 
-// Poll for new messages (cron notifications) every 15s
+// Poll for new messages (cron notifications) every 10s
 async function pollNewMessages() {
-  if (sending) return; // don't poll while actively chatting
+  if (sending) return;
   const sid = sessionEl.value;
   try {
     const res = await fetch(`?action=history&session_id=${encodeURIComponent(sid)}`);
+    if (!res.ok) return;
     const data = await res.json();
     if (data.messages.length > lastMessageCount) {
-      // New messages arrived (likely cron notifications)
       const newMsgs = data.messages.slice(lastMessageCount);
       for (const msg of newMsgs) {
         if (msg.role === 'assistant' && msg.text) {
           addMessage('assistant', msg.text);
         }
+        if (msg.tool_calls) {
+          for (const tc of msg.tool_calls) {
+            if (tc.name !== 'result') {
+              addToolCall(tc.name, tc.args || {}, 'ok');
+            }
+          }
+        }
       }
       lastMessageCount = data.messages.length;
       scrollToBottom();
     }
-  } catch (e) { /* ignore poll failures */ }
+  } catch (e) { /* ignore */ }
 }
 
-setInterval(pollNewMessages, 15000);
+setInterval(pollNewMessages, 10000);
 
 // Load on startup
 loadHistory();

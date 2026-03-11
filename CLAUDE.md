@@ -12,16 +12,16 @@ OpenClaw Agent Harness의 Python 포트. 원본의 모든 "지능(intelligence)"
 
 - Python 3.11+, 가상환경: `.venv/`
 - 빌드: hatchling
-- 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile, croniter, python-dateutil, playwright
+- 의존성: openai, tiktoken, numpy, pydantic, httpx, rich, beautifulsoup4, PyPDF2, PyYAML, olefile, croniter, python-dateutil, playwright, fastapi, uvicorn
 - 설정: `config.toml` (gitignore됨) / `config.example.toml` (vLLM 예시)
-- 총 소스: ~6,500줄 코어 + ~1,500줄 builtins (63개 모듈)
+- 총 소스: ~11,100줄 코어 + ~1,530줄 builtins (65개 모듈)
 
 ## 디렉토리 구조
 
 ```
 openclaw/
 ├── agent/          # Agent API, 에이전트 루프, 타입 정의
-│   ├── api.py           877줄  Agent 클래스 (Python API 진입점)
+│   ├── api.py           967줄  Agent 클래스 (Python API 진입점)
 │   ├── loop.py          685줄  메인 루프 (run → attempt → stream → tool dispatch)
 │   └── types.py         288줄  AgentMessage, ToolDefinition, RunResult 등
 ├── model/          # LLM 프로바이더, 페일오버
@@ -31,7 +31,7 @@ openclaw/
 │   ├── cooldown.py      162줄  ProfileCooldown·ApiKeyRotator·백오프
 │   └── thinking.py       62줄  Thinking 레벨 해석·폴백
 ├── session/        # 세션 관리, 컴팩션, 프루닝
-│   ├── manager.py       347줄  JSONL append-only 세션 (ephemeral 지원)
+│   ├── manager.py       350줄  JSONL append-only 세션 (ephemeral 지원)
 │   ├── compaction.py    708줄  다단계 컴팩션 (split→summarize→merge)
 │   ├── identifiers.py    73줄  식별자 추출·정규화
 │   ├── safeguard.py     326줄  컴팩션 품질 검증·도구 실패 추적
@@ -69,7 +69,11 @@ openclaw/
 ├── hooks/          # Hook 시스템 (shlex 인젝션 방어)
 │   └── __init__.py       87줄  pre/post tool_call, pre/post message, on_error
 ├── cron/           # Cron/Heartbeat (3종 스케줄: every, cron, at)
-│   └── __init__.py      377줄  CronScheduler, 모델 핑, 메모리 체크, HEARTBEAT.md
+│   ├── __init__.py      377줄  CronScheduler, 모델 핑, 메모리 체크, HEARTBEAT.md
+│   └── persistence.py   143줄  크론잡 JSON 영속화·복원·미실행 감지
+├── server.py       229줄  FastAPI 웹 서버 (send+poll 채팅, 크론, 세션 API)
+├── static/
+│   └── index.html       391줄  단일 파일 채팅 UI (HTML/CSS/JS)
 ├── config.py       207줄  TOML 설정 로딩
 └── repl.py         148줄  대화형 REPL (슬림 UI 레이어)
 ```
@@ -84,6 +88,18 @@ openclaw/
 - `_build_context()`: AgentContext 조립 (도구, 메모리, 세션, 프롬프트)
 - 서브에이전트 도구 (spawn, batch, list, read) 자동 등록
 - 에페머럴 세션: `cron-`, `heartbeat` 접두사 세션은 자동으로 디스크 I/O 없이 메모리만 사용
+
+### 웹 서버 (`server.py` + `static/index.html`)
+- FastAPI 기반, code-server 리버스 프록시 호환 (GET only, 루트 경로, 상대 URL)
+- **send+poll 패턴**: `?action=send` → 즉시 반환, 백그라운드 실행 → 프론트엔드가 `?action=history` 폴링
+- `?action=status` — 에이전트 처리 중 여부 확인
+- 단일 HTML 파일 채팅 UI (다크 테마, 세션 전환, 크론 패널)
+- 크론잡 결과는 `_post_cron_notification()`으로 세션에 기록 → 브라우저 오프라인이어도 나중에 확인 가능
+
+### 크론잡 영속화 (`cron/persistence.py`)
+- `jobs.json`에 사용자 크론잡 저장 (시스템 태스크 제외)
+- 서버 재시작 시 `restore_cron_jobs()`로 복원 + `check_missed_jobs()`로 미실행 감지·catch-up
+- 콜백 재구성: `_make_cron_callback()`으로 에페머럴 세션에서 실행 → 결과를 web 세션에 알림
 
 ### 에이전트 루프 (`agent/loop.py`)
 - `run()` → `_attempt_loop()` → stream → tool dispatch → re-entry (최대 50턴)
@@ -137,7 +153,8 @@ openclaw/
 cd ~/miniclaw
 source .venv/bin/activate
 pip install -e .
-openclaw-py              # 대화형 REPL
+openclaw-py                           # 대화형 REPL
+openclaw-serve --reload               # 웹 서버 (기본 포트 8089)
 python tests/test_live.py [--offline]  # 테스트 (58개, --offline: 오프라인만)
 ```
 

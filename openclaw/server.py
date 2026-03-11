@@ -1,9 +1,10 @@
-"""Minimal web server for the OpenClaw agent — SSE streaming chat + cron.
+"""Minimal web server for the OpenClaw agent — send+poll chat + cron.
 
 All endpoints are served under "/" to work behind reverse proxies that
 only forward the root path. Query parameter "action" selects the operation:
   GET /                          → chat UI (HTML)
-  GET /?action=chat&message=...  → SSE streaming chat
+  GET /?action=send&message=...  → send message (fire-and-forget, returns immediately)
+  GET /?action=status            → check if agent is processing (JSON)
   GET /?action=history&session_id=... → load previous messages (JSON)
   GET /?action=cron              → cron job list (JSON)
   GET /?action=sessions          → active sessions (JSON)
@@ -19,18 +20,19 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from openclaw.agent.api import Agent
 from openclaw.agent.loop import run
-from openclaw.agent.types import AgentMessage, TextBlock, ToolResult, ToolUseBlock, ToolResultBlock
+from openclaw.agent.types import AgentMessage, TextBlock, ToolUseBlock, ToolResultBlock
 
 log = logging.getLogger("openclaw.server")
 
 # ---------------------------------------------------------------------------
-# Global agent instance (created on startup)
+# Global agent instance + running task tracker
 # ---------------------------------------------------------------------------
 _agent: Agent | None = None
+_running_tasks: dict[str, asyncio.Task] = {}  # session_id → task
 
 
 def _get_agent() -> Agent:
@@ -75,8 +77,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def root(request: Request):
     action = request.query_params.get("action", "")
 
-    if action == "chat":
-        return await _handle_chat(request)
+    if action == "send":
+        return await _handle_send(request)
+    elif action == "status":
+        return _handle_status(request)
     elif action == "history":
         return _handle_history(request)
     elif action == "cron":
@@ -94,74 +98,45 @@ async def root(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Chat (SSE streaming)
+# Send (fire-and-forget) + Status
 # ---------------------------------------------------------------------------
 
-async def _handle_chat(request: Request) -> StreamingResponse:
+async def _handle_send(request: Request) -> JSONResponse:
+    """Accept a message, start processing in background, return immediately."""
     message = request.query_params.get("message", "").strip()
     session_id = request.query_params.get("session_id", "web")
 
     if not message:
         return JSONResponse({"error": "message is required"}, status_code=400)
 
+    # Don't accept new messages while already processing for this session
+    existing = _running_tasks.get(session_id)
+    if existing and not existing.done():
+        return JSONResponse({"error": "already processing"}, status_code=409)
+
     agent = _get_agent()
 
-    async def event_stream() -> AsyncIterator[str]:
-        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-
-        def on_stream(text: str) -> None:
-            queue.put_nowait({"event": "text", "data": {"text": text}})
-
-        def on_tool_start(name: str, args: dict) -> None:
-            queue.put_nowait({
-                "event": "tool_start",
-                "data": {"name": name, "args": {k: str(v)[:100] for k, v in args.items()}},
-            })
-
-        def on_tool_end(name: str, result: ToolResult) -> None:
-            queue.put_nowait({
-                "event": "tool_end",
-                "data": {
-                    "name": name,
-                    "ok": not result.is_error,
-                    "preview": result.content[:200].replace("\n", " "),
-                },
-            })
-
-        ctx = agent._build_context(session_id)
-        ctx.on_stream = on_stream
-        ctx.on_tool_start = on_tool_start
-        ctx.on_tool_end = on_tool_end
-
-        async def run_agent() -> Any:
-            return await run(ctx, message)
-
-        task = asyncio.create_task(run_agent())
-
-        # Yield SSE events as they arrive
-        while not task.done():
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=0.2)
-                if item is None:
-                    break
-                yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-            except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
-
-        # Drain remaining events
-        while not queue.empty():
-            item = queue.get_nowait()
-            if item is not None:
-                yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-
-        # Final result
+    async def _run_in_background() -> None:
         try:
-            result = task.result()
-            yield f"event: done\ndata: {json.dumps({'text': result.text or '', 'error': result.error, 'compacted': result.compacted}, ensure_ascii=False)}\n\n"
-        except Exception as exc:
-            yield f"event: error\ndata: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+            ctx = agent._build_context(session_id)
+            await run(ctx, message)
+        except Exception:
+            log.exception("Background agent run failed for session=%s", session_id)
+        finally:
+            _running_tasks.pop(session_id, None)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    task = asyncio.create_task(_run_in_background())
+    _running_tasks[session_id] = task
+
+    return JSONResponse({"ok": True})
+
+
+def _handle_status(request: Request) -> JSONResponse:
+    """Check if the agent is currently processing for a session."""
+    session_id = request.query_params.get("session_id", "web")
+    existing = _running_tasks.get(session_id)
+    processing = existing is not None and not existing.done()
+    return JSONResponse({"processing": processing})
 
 
 # ---------------------------------------------------------------------------
