@@ -17,6 +17,8 @@ dependencies = [
     "croniter>=6.0.0",
     "python-dateutil>=2.9.0",
     "playwright>=1.40.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,7 @@ dev = [
 
 [project.scripts]
 openclaw-py = "openclaw.repl:main"
+openclaw-serve = "openclaw.server:main"
 
 [build-system]
 requires = ["hatchling"]

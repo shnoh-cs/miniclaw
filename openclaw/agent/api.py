@@ -106,6 +106,9 @@ class Agent:
         # Cron/heartbeat scheduler (must init before cron tool registration)
         self._scheduler = CronScheduler()
 
+        # Cron task descriptions for persistence (name -> task string)
+        self._cron_task_descriptions: dict[str, str] = {}
+
         # Register cron + session_status + browser tools (need agent/scheduler refs)
         self._register_cron_tools()
         self._register_session_status_tool()
@@ -482,6 +485,94 @@ class Agent:
 
         self.tool_registry.register(batch_spawn_def, batch_executor, group="subagent")
 
+    def _make_cron_callback(self, name: str, task_desc: str, one_shot: bool) -> Any:
+        """Build a cron callback closure that runs a task through the agent loop."""
+        agent_ref = self
+        scheduler = self._scheduler
+
+        async def _cron_callback(
+            _task: str = task_desc,
+            _name: str = name,
+            _one_shot: bool = one_shot,
+        ) -> None:
+            prompt = (
+                f"You are running a scheduled cron job '{_name}'. "
+                f"Execute the following task:\n\n{_task}"
+            )
+            try:
+                result = await agent_ref.run(
+                    prompt,
+                    session_id=f"cron-{_name}",
+                )
+                text = result.text or ""
+                if text.strip().upper() != "NO_REPLY":
+                    log.info("Cron '%s' output: %s", _name, text[:200])
+            except Exception as exc:
+                log.warning("Cron '%s' failed: %s", _name, exc)
+
+            # Auto-delete one-shot jobs after completion
+            if _one_shot:
+                scheduler.unregister(_name)
+                agent_ref._cron_task_descriptions.pop(_name, None)
+
+        return _cron_callback
+
+    def _save_cron_jobs(self) -> None:
+        """Persist cron jobs to disk."""
+        try:
+            from openclaw.cron.persistence import save_jobs
+            path = self.workspace / "jobs.json"
+            save_jobs(self._scheduler, self._cron_task_descriptions, path)
+        except Exception as exc:
+            log.warning("Failed to save cron jobs: %s", exc)
+
+    async def restore_cron_jobs(self) -> None:
+        """Restore persisted cron jobs and catch up missed ones."""
+        from openclaw.cron import Schedule, ScheduleKind, TaskStatus
+        from openclaw.cron.persistence import check_missed_jobs, load_jobs
+
+        path = self.workspace / "jobs.json"
+        records = load_jobs(path)
+        if not records:
+            return
+
+        missed = set(check_missed_jobs(records))
+
+        for rec in records:
+            callback = self._make_cron_callback(rec.name, rec.task, rec.one_shot)
+            schedule = rec.to_schedule()
+            self._scheduler.register(
+                rec.name, callback, schedule=schedule, one_shot=rec.one_shot,
+            )
+            self._cron_task_descriptions[rec.name] = rec.task
+
+            # Restore run state
+            task_obj = self._scheduler._tasks.get(rec.name)
+            if task_obj:
+                task_obj.last_run = rec.last_run
+                task_obj.run_count = rec.run_count
+
+        # Start scheduler if needed
+        if not self._scheduler._running:
+            await self._scheduler.start()
+        else:
+            for name, task_obj in self._scheduler._tasks.items():
+                if task_obj.status in (TaskStatus.PENDING, TaskStatus.COMPLETED):
+                    import asyncio as _aio
+                    task_obj._task = _aio.create_task(
+                        self._scheduler._run_loop(task_obj),
+                        name=f"cron-{name}",
+                    )
+                    task_obj.status = TaskStatus.RUNNING
+
+        # Catch up missed jobs
+        for rec in records:
+            if rec.name in missed:
+                log.info("Catching up missed cron job: %s", rec.name)
+                callback = self._make_cron_callback(rec.name, rec.task, rec.one_shot)
+                import asyncio as _aio
+                _aio.create_task(callback())
+
     def _register_cron_tools(self) -> None:
         """Register cron tool — manage scheduled jobs at runtime."""
         import time as _time
@@ -571,34 +662,11 @@ class Agent:
                         is_error=True,
                     )
 
-                # Build callback that runs task through the agent loop
-                async def _cron_callback(
-                    _task: str = task_desc,
-                    _name: str = name,
-                    _one_shot: bool = one_shot,
-                ) -> None:
-                    prompt = (
-                        f"You are running a scheduled cron job '{_name}'. "
-                        f"Execute the following task:\n\n{_task}"
-                    )
-                    try:
-                        result = await agent_ref.run(
-                            prompt,
-                            session_id=f"cron-{_name}",
-                        )
-                        text = result.text or ""
-                        if text.strip().upper() != "NO_REPLY":
-                            log.info("Cron '%s' output: %s", _name, text[:200])
-                    except Exception as exc:
-                        log.warning("Cron '%s' failed: %s", _name, exc)
-
-                    # Auto-delete one-shot jobs after completion
-                    if _one_shot:
-                        scheduler.unregister(_name)
-
+                callback = agent_ref._make_cron_callback(name, task_desc, one_shot)
                 scheduler.register(
-                    name, _cron_callback, schedule=schedule, one_shot=one_shot,
+                    name, callback, schedule=schedule, one_shot=one_shot,
                 )
+                agent_ref._cron_task_descriptions[name] = task_desc
 
                 # Auto-start scheduler if not running
                 if not scheduler._running:
@@ -619,6 +687,9 @@ class Agent:
                         )
                         task_obj.status = TaskStatus.RUNNING
 
+                # Persist to disk
+                agent_ref._save_cron_jobs()
+
                 return ToolResult(
                     tool_use_id="",
                     content=(
@@ -636,6 +707,8 @@ class Agent:
                     )
                 removed = scheduler.unregister(name)
                 if removed:
+                    agent_ref._cron_task_descriptions.pop(name, None)
+                    agent_ref._save_cron_jobs()
                     return ToolResult(
                         tool_use_id="", content=f"Deleted cron job '{name}'.",
                     )
