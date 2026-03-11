@@ -1101,6 +1101,306 @@ async def test_tiktoken_estimation(agent) -> tuple[bool, str]:
     )
 
 
+# ── 통합 테스트 (모듈 간 경계) ────────────────────────────
+
+
+async def test_compaction_orphan_tool_result(agent) -> tuple[bool, str]:
+    """컴팩션 후 orphan tool_result가 제거되는지 검증."""
+    from openclaw.agent.types import (
+        AgentMessage, TextBlock, ToolResultBlock, ToolUseBlock,
+    )
+    from openclaw.session.compaction import _strip_leading_orphan_tool_results
+
+    tu_id = "toolu_test_orphan_123"
+
+    # Simulate: assistant with tool_use was discarded, user with tool_result remains
+    messages = [
+        # This user message has an orphan tool_result (no preceding assistant tool_use)
+        AgentMessage(role="user", content=[
+            ToolResultBlock(tool_use_id=tu_id, content="some output"),
+        ]),
+        # Normal conversation continues
+        AgentMessage(role="user", content=[TextBlock(text="다음 질문")]),
+        AgentMessage(role="assistant", content=[TextBlock(text="답변")]),
+    ]
+
+    cleaned = _strip_leading_orphan_tool_results(messages)
+
+    # The orphan tool_result message should be stripped
+    has_orphan = any(
+        tr.tool_use_id == tu_id
+        for m in cleaned
+        for tr in m.tool_results
+    )
+    ok1 = not has_orphan
+    ok2 = len(cleaned) == 2  # orphan message removed, 2 remaining
+
+    return ok1 and ok2, f"orphan_removed={ok1}, remaining={len(cleaned)}"
+
+
+async def test_compaction_preserves_valid_pairs(agent) -> tuple[bool, str]:
+    """컴팩션 strip이 정상 tool_use↔tool_result 쌍은 건드리지 않는지 검증."""
+    from openclaw.agent.types import (
+        AgentMessage, TextBlock, ToolResultBlock, ToolUseBlock,
+    )
+    from openclaw.session.compaction import _strip_leading_orphan_tool_results
+
+    tu_id = "toolu_valid_pair_456"
+
+    messages = [
+        # Valid pair: assistant tool_use followed by user tool_result
+        AgentMessage(role="assistant", content=[
+            TextBlock(text="let me check"),
+            ToolUseBlock(id=tu_id, name="bash", input={"command": "ls"}),
+        ]),
+        AgentMessage(role="user", content=[
+            ToolResultBlock(tool_use_id=tu_id, content="file1.txt"),
+        ]),
+        AgentMessage(role="assistant", content=[TextBlock(text="done")]),
+    ]
+
+    cleaned = _strip_leading_orphan_tool_results(messages)
+    ok = len(cleaned) == 3  # All messages should be preserved
+    return ok, f"all_preserved={ok}, count={len(cleaned)}"
+
+
+async def test_repair_backward_orphan(agent) -> tuple[bool, str]:
+    """_repair_tool_pairing이 역방향 orphan도 수리하는지 검증."""
+    import tempfile
+    from openclaw.agent.types import (
+        AgentMessage, TextBlock, ToolResultBlock, ToolUseBlock,
+    )
+    from openclaw.session.manager import SessionManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sm = SessionManager(Path(tmpdir), "test-repair-backward")
+
+        orphan_id = "toolu_orphan_backward_789"
+        valid_id = "toolu_valid_xyz"
+
+        sm.messages = [
+            # Orphan: tool_result with no matching tool_use anywhere
+            AgentMessage(role="user", content=[
+                ToolResultBlock(tool_use_id=orphan_id, content="orphan result"),
+            ]),
+            # Valid pair
+            AgentMessage(role="assistant", content=[
+                ToolUseBlock(id=valid_id, name="bash", input={}),
+            ]),
+            AgentMessage(role="user", content=[
+                ToolResultBlock(tool_use_id=valid_id, content="valid result"),
+            ]),
+        ]
+
+        sm._repair_tool_pairing()
+
+        # Orphan should be removed
+        remaining_orphans = [
+            tr for m in sm.messages for tr in m.tool_results
+            if tr.tool_use_id == orphan_id
+        ]
+        ok1 = len(remaining_orphans) == 0
+
+        # Valid pair should be preserved
+        valid_results = [
+            tr for m in sm.messages for tr in m.tool_results
+            if tr.tool_use_id == valid_id
+        ]
+        ok2 = len(valid_results) == 1
+
+        return ok1 and ok2, f"orphan_removed={ok1}, valid_kept={ok2}"
+
+
+async def test_api_message_structure_after_compaction(agent) -> tuple[bool, str]:
+    """컴팩션 후 메시지가 API 포맷으로 변환 가능한지 검증.
+
+    핵심: role='tool' 메시지 앞에 반드시 tool_calls가 있어야 함.
+    """
+    from openclaw.agent.types import (
+        AgentMessage, TextBlock, ToolResultBlock, ToolUseBlock,
+    )
+    from openclaw.session.compaction import _strip_leading_orphan_tool_results
+
+    tu_id = "toolu_api_check_001"
+
+    # Simulate post-compaction messages starting with orphan tool_result
+    messages = [
+        AgentMessage(role="user", content=[
+            ToolResultBlock(tool_use_id=tu_id, content="output"),
+        ]),
+        AgentMessage(role="assistant", content=[TextBlock(text="ok")]),
+        AgentMessage(role="user", content=[TextBlock(text="next")]),
+    ]
+
+    cleaned = _strip_leading_orphan_tool_results(messages)
+
+    # Verify structural invariant: no tool_result without preceding tool_use
+    tool_use_ids_seen: set[str] = set()
+    violations = 0
+    for msg in cleaned:
+        if msg.role == "assistant":
+            for tu in msg.tool_uses:
+                tool_use_ids_seen.add(tu.id)
+        elif msg.role == "user":
+            for tr in msg.tool_results:
+                if tr.tool_use_id not in tool_use_ids_seen:
+                    violations += 1
+
+    ok = violations == 0
+    return ok, f"violations={violations}, msgs={len(cleaned)}"
+
+
+async def test_prompt_cache_stability(agent) -> tuple[bool, str]:
+    """build_system_prompt이 1초 간격 호출에서 동일 문자열을 반환하는지 검증.
+
+    Date/Time이 매 턴 변하면 Anthropic prefix 캐시가 무효화됨.
+    """
+    import time as _time
+    from openclaw.prompt.builder import build_system_prompt
+
+    tools = agent.tool_registry.get_definitions()
+
+    prompt1 = build_system_prompt(
+        config=agent.config, tools=tools, workspace_dir=str(agent.workspace),
+    )
+    _time.sleep(1.1)
+    prompt2 = build_system_prompt(
+        config=agent.config, tools=tools, workspace_dir=str(agent.workspace),
+    )
+
+    ok = prompt1 == prompt2
+    if not ok:
+        # Find the first difference
+        lines1 = prompt1.split("\n")
+        lines2 = prompt2.split("\n")
+        diff_line = "?"
+        for i, (a, b) in enumerate(zip(lines1, lines2)):
+            if a != b:
+                diff_line = f"L{i+1}: '{a[:60]}' vs '{b[:60]}'"
+                break
+        return False, f"prompts differ at {diff_line}"
+
+    return True, f"identical ({len(prompt1)} chars)"
+
+
+async def test_cron_tool_registered(agent) -> tuple[bool, str]:
+    """cron 도구가 등록되어 있고 list action이 동작하는지 검증."""
+    defs = agent.tool_registry.get_definitions()
+    has_cron = any(d.name == "cron" for d in defs)
+
+    # Execute list action
+    executor = agent.tool_registry.get("cron")
+    executor = executor.executor if executor else None
+    if executor:
+        result = await executor({"action": "list"})
+        list_ok = not result.is_error or result.content == "No scheduled jobs."
+    else:
+        list_ok = False
+
+    return has_cron and list_ok, f"registered={has_cron}, list_ok={list_ok}"
+
+
+async def test_session_status_tool(agent) -> tuple[bool, str]:
+    """session_status 도구가 현재 시간과 모델 정보를 반환하는지 검증."""
+    tool = agent.tool_registry.get("session_status")
+    executor = tool.executor if tool else None
+    if not executor:
+        return False, "session_status not registered"
+
+    result = await executor({})
+    content = result.content
+
+    has_time = "Current time:" in content
+    has_model = "Model:" in content
+    has_thinking = "Thinking:" in content
+
+    ok = has_time and has_model and has_thinking and not result.is_error
+    return ok, f"time={has_time}, model={has_model}, thinking={has_thinking}"
+
+
+async def test_cron_tool_create_delete(agent) -> tuple[bool, str]:
+    """cron 도구로 잡 생성/조회/삭제 사이클이 동작하는지 검증."""
+    executor = agent.tool_registry.get("cron")
+    executor = executor.executor if executor else None
+    if not executor:
+        return False, "cron not registered"
+
+    # Create
+    result = await executor({
+        "action": "create",
+        "name": "test_integration_job",
+        "interval_seconds": 3600,
+        "task": "test task description",
+        "one_shot": True,
+    })
+    created = not result.is_error and "test_integration_job" in result.content
+
+    # Status
+    result = await executor({"action": "status", "name": "test_integration_job"})
+    found = not result.is_error and "test_integration_job" in result.content
+
+    # Delete
+    result = await executor({"action": "delete", "name": "test_integration_job"})
+    deleted = not result.is_error
+
+    # Verify gone
+    result = await executor({"action": "status", "name": "test_integration_job"})
+    gone = result.is_error
+
+    ok = created and found and deleted and gone
+    return ok, f"created={created}, found={found}, deleted={deleted}, gone={gone}"
+
+
+async def test_compaction_mixed_leading_messages(agent) -> tuple[bool, str]:
+    """선두에 text+tool_result 혼합 user 메시지가 있을 때 text만 보존되는지 검증."""
+    from openclaw.agent.types import (
+        AgentMessage, TextBlock, ToolResultBlock,
+    )
+    from openclaw.session.compaction import _strip_leading_orphan_tool_results
+
+    messages = [
+        AgentMessage(role="user", content=[
+            TextBlock(text="이전 대화 이어서"),
+            ToolResultBlock(tool_use_id="toolu_mixed_001", content="stale output"),
+        ]),
+        AgentMessage(role="assistant", content=[TextBlock(text="네")]),
+    ]
+
+    cleaned = _strip_leading_orphan_tool_results(messages)
+
+    # Text block should be kept, tool_result should be stripped
+    first_msg = cleaned[0]
+    has_text = any(isinstance(b, TextBlock) for b in first_msg.content)
+    has_tool = any(isinstance(b, ToolResultBlock) for b in first_msg.content)
+
+    ok = has_text and not has_tool and len(cleaned) == 2
+    return ok, f"text_kept={has_text}, tool_stripped={not has_tool}"
+
+
+async def test_identity_no_overpromise(agent) -> tuple[bool, str]:
+    """Identity 섹션이 구체적 도구 목록을 하드코딩하지 않는지 검증."""
+    from openclaw.prompt.builder import build_system_prompt
+
+    prompt = build_system_prompt(
+        config=agent.config,
+        tools=agent.tool_registry.get_definitions(),
+        workspace_dir=str(agent.workspace),
+    )
+
+    # Identity 섹션 추출 (첫 번째 섹션 ~ "## Tooling" 전까지)
+    identity_end = prompt.find("## Tooling")
+    if identity_end < 0:
+        identity_end = prompt.find("## Safety")
+    identity = prompt[:identity_end] if identity_end > 0 else prompt[:500]
+
+    # Identity에 구체적 도구 이름이 하드코딩되어 있으면 안 됨
+    # (cron, bash 같은 이름은 예시 문맥에서 OK, 하지만 bullet list로 나열하면 NG)
+    has_bullet_list = identity.count("- **") > 2  # 3개 이상 bullet이면 과잉 나열
+
+    ok = not has_bullet_list
+    return ok, f"concise_identity={ok}, bullets={identity.count('- **')}"
+
+
 # ── 메인 ─────────────────────────────────────────────────
 
 
@@ -1181,11 +1481,24 @@ async def main() -> None:
     await run_test("연속 컴팩션 방지", test_double_compaction_guard(agent))
     await run_test("tiktoken 토큰 추정", test_tiktoken_estimation(agent))
 
+    # ── 통합 테스트 (모듈 간 경계, 오프라인) ──
+    header("4. 통합 테스트 (모듈 간 경계)")
+    await run_test("컴팩션 orphan tool_result 제거", test_compaction_orphan_tool_result(agent))
+    await run_test("컴팩션 정상 쌍 보존", test_compaction_preserves_valid_pairs(agent))
+    await run_test("역방향 orphan 수리", test_repair_backward_orphan(agent))
+    await run_test("API 메시지 구조 검증", test_api_message_structure_after_compaction(agent))
+    await run_test("프롬프트 캐시 안정성", test_prompt_cache_stability(agent))
+    await run_test("cron 도구 등록/list", test_cron_tool_registered(agent))
+    await run_test("session_status 도구", test_session_status_tool(agent))
+    await run_test("cron 생성/조회/삭제", test_cron_tool_create_delete(agent))
+    await run_test("혼합 선두 메시지 처리", test_compaction_mixed_leading_messages(agent))
+    await run_test("Identity 과잉 약속 방지", test_identity_no_overpromise(agent))
+
     # ── 라이브 테스트 (API 호출) ──
     if args.offline:
-        header("4. 라이브 테스트 — 건너뜀 (--offline)")
+        header("5. 라이브 테스트 — 건너뜀 (--offline)")
     else:
-        header("4. 라이브 테스트 (API 호출)")
+        header("5. 라이브 테스트 (API 호출)")
         live_tests = [
             ("단순 대화", test_simple_chat),
             ("Read 도구", test_tool_read),
