@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -11,6 +14,38 @@ import httpx
 from openclaw.config import RocketChatConfig
 
 log = logging.getLogger("openclaw.rocketchat")
+
+
+# ---------------------------------------------------------------------------
+# Poll data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PollTarget:
+    """One user being polled."""
+
+    username: str
+    room_id: str
+    responded: bool = False
+    response: str = ""
+
+
+@dataclass
+class ActivePoll:
+    """Tracks a multi-user poll lifecycle."""
+
+    poll_id: str
+    question: str
+    requester_room: str  # room_id to send aggregated results to
+    targets: dict[str, PollTarget] = field(default_factory=dict)
+    deadline: float = 0.0  # unix timestamp
+    completed: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Rocket.Chat REST client
+# ---------------------------------------------------------------------------
 
 
 class RocketChatClient:
@@ -82,8 +117,21 @@ class RocketChatClient:
         resp.raise_for_status()
         return resp.json().get("ims", [])
 
+    async def create_dm(self, username: str) -> str:
+        """Create (or get existing) DM channel with *username*, return room_id."""
+        resp = await self._client.post(
+            "/api/v1/im.create", json={"username": username}
+        )
+        resp.raise_for_status()
+        return resp.json()["room"]["_id"]
+
     async def close(self) -> None:
         await self._client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Polling bridge
+# ---------------------------------------------------------------------------
 
 
 class RocketChatBridge:
@@ -103,6 +151,10 @@ class RocketChatBridge:
         self._processing: dict[str, bool] = {}
         # channel name → room_id
         self._channel_ids: dict[str, str] = {}
+
+        # Poll tracking
+        self._active_polls: dict[str, ActivePoll] = {}  # poll_id → poll
+        self._room_to_poll: dict[str, tuple[str, str]] = {}  # room_id → (poll_id, username)
 
     async def start(self) -> None:
         await self._client.login(self._config.user, self._config.password)
@@ -130,6 +182,10 @@ class RocketChatBridge:
                 pass
         await self._client.close()
         log.info("Rocket.Chat bridge stopped")
+
+    # ------------------------------------------------------------------
+    # Notifications
+    # ------------------------------------------------------------------
 
     async def send_notification(self, text: str, reply_to: str = "") -> None:
         """Send a cron notification to the originating room or fallback channel.
@@ -160,6 +216,157 @@ class RocketChatBridge:
                 log.warning("Cannot resolve notify channel: %s", channel)
                 return
         await self._client.send_message(rid, text)
+
+    # ------------------------------------------------------------------
+    # Send DM (proactive)
+    # ------------------------------------------------------------------
+
+    async def send_dm(self, username: str, message: str) -> str:
+        """Create/get DM with *username* and send *message*. Returns room_id."""
+        room_id = await self._client.create_dm(username)
+        await self._client.send_message(room_id, message)
+        # Ensure poller picks up this room and skips the message we just sent
+        from datetime import datetime, timezone
+        self._last_ts[room_id] = datetime.now(timezone.utc).isoformat()
+        return room_id
+
+    # ------------------------------------------------------------------
+    # Poll system
+    # ------------------------------------------------------------------
+
+    async def create_poll(
+        self,
+        question: str,
+        usernames: list[str],
+        requester_room: str,
+        deadline_minutes: int = 60,
+    ) -> ActivePoll:
+        """Send *question* to each user via DM and track responses."""
+        poll_id = uuid.uuid4().hex[:8]
+        poll = ActivePoll(
+            poll_id=poll_id,
+            question=question,
+            requester_room=requester_room,
+            deadline=time.time() + deadline_minutes * 60,
+        )
+
+        failed: list[str] = []
+        for username in usernames:
+            try:
+                room_id = await self.send_dm(username, question)
+                poll.targets[username] = PollTarget(username=username, room_id=room_id)
+                self._room_to_poll[room_id] = (poll_id, username)
+                log.info("Poll %s: sent to %s (room %s)", poll_id, username, room_id)
+            except Exception:
+                log.warning("Poll %s: failed to DM %s", poll_id, username)
+                failed.append(username)
+
+        self._active_polls[poll_id] = poll
+
+        # Schedule deadline aggregation
+        delay = deadline_minutes * 60
+        asyncio.create_task(
+            self._poll_deadline(poll_id, delay), name=f"poll-deadline-{poll_id}"
+        )
+
+        if failed:
+            log.warning("Poll %s: could not reach %s", poll_id, ", ".join(failed))
+
+        return poll
+
+    async def _poll_deadline(self, poll_id: str, delay: float) -> None:
+        """Wait for deadline then force-aggregate remaining responses."""
+        await asyncio.sleep(delay)
+        poll = self._active_polls.get(poll_id)
+        if poll and not poll.completed:
+            log.info("Poll %s: deadline reached, aggregating", poll_id)
+            await self._aggregate_poll(poll_id)
+
+    async def _record_poll_response(
+        self, room_id: str, text: str,
+    ) -> bool:
+        """Record a poll response. Returns True if handled, False otherwise."""
+        info = self._room_to_poll.get(room_id)
+        if not info:
+            return False
+
+        poll_id, username = info
+        poll = self._active_polls.get(poll_id)
+        if not poll or poll.completed:
+            # Poll finished — remove stale mapping and let normal handling proceed
+            self._room_to_poll.pop(room_id, None)
+            return False
+
+        target = poll.targets.get(username)
+        if not target or target.responded:
+            return False
+
+        target.responded = True
+        target.response = text
+        log.info("Poll %s: response from %s", poll_id, username)
+
+        # Acknowledge
+        try:
+            await self._client.send_message(room_id, "답변이 기록되었습니다. 감사합니다!")
+        except Exception:
+            pass
+
+        # Remove from tracking so subsequent messages are handled normally
+        self._room_to_poll.pop(room_id, None)
+
+        # Check if all responded
+        if all(t.responded for t in poll.targets.values()):
+            await self._aggregate_poll(poll_id)
+
+        return True
+
+    async def _aggregate_poll(self, poll_id: str) -> None:
+        """Aggregate poll responses and send results to the requester."""
+        poll = self._active_polls.get(poll_id)
+        if not poll or poll.completed:
+            return
+        poll.completed = True
+
+        # Clean up remaining room mappings
+        for target in poll.targets.values():
+            self._room_to_poll.pop(target.room_id, None)
+
+        # Build summary
+        lines = [f"**설문 결과** (질문: {poll.question})\n"]
+        responded = 0
+        for target in poll.targets.values():
+            if target.responded:
+                lines.append(f"- **{target.username}**: {target.response}")
+                responded += 1
+            else:
+                lines.append(f"- **{target.username}**: (미응답)")
+        lines.append(f"\n응답률: {responded}/{len(poll.targets)}")
+        summary = "\n".join(lines)
+
+        # Let the agent analyze and deliver the results
+        prompt = (
+            f"A poll has been completed. Summarize the results and help the user "
+            f"make a decision based on the responses.\n\n{summary}"
+        )
+        try:
+            result = await self._agent.run(
+                prompt, session_id=f"rc-{poll.requester_room}",
+            )
+            reply = result.text or summary
+            await self._client.send_message(poll.requester_room, reply)
+        except Exception:
+            log.exception("Poll %s: aggregation failed, sending raw summary", poll_id)
+            try:
+                await self._client.send_message(poll.requester_room, summary)
+            except Exception:
+                pass
+
+        # Cleanup
+        self._active_polls.pop(poll_id, None)
+
+    # ------------------------------------------------------------------
+    # Main polling loop
+    # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
         while self._running:
@@ -233,6 +440,10 @@ class RocketChatBridge:
             )
 
     async def _handle_message(self, room_id: str, text: str) -> None:
+        # Check for poll response first
+        if await self._record_poll_response(room_id, text):
+            return
+
         if self._processing.get(room_id):
             return
         self._processing[room_id] = True

@@ -115,6 +115,9 @@ class Agent:
         # Current session_id being processed
         self._current_session_id: str = "default"
 
+        # Rocket.Chat bridge ref (set later via _register_rc_tools)
+        self._rc_bridge: Any = None
+
         # Register cron + session_status + browser tools (need agent/scheduler refs)
         self._register_cron_tools()
         self._register_session_status_tool()
@@ -864,6 +867,153 @@ class Agent:
             return ToolResult(tool_use_id="", content=result, is_error=is_err)
 
         self.tool_registry.register(browser_def, browser_executor, group="web")
+
+    def _register_rc_tools(self, bridge: Any) -> None:
+        """Register Rocket.Chat tools (send_dm, poll) — called after bridge init."""
+        from openclaw.agent.types import ToolDefinition, ToolParameter, ToolResult
+
+        self._rc_bridge = bridge
+        agent_ref = self
+
+        # -- send_dm tool --
+        send_dm_def = ToolDefinition(
+            name="send_dm",
+            description=(
+                "Send a direct message to a Rocket.Chat user by username. "
+                "Creates a DM channel if one doesn't exist."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="username", type="string",
+                    description="Rocket.Chat username to message",
+                ),
+                ToolParameter(
+                    name="message", type="string",
+                    description="Message text to send",
+                ),
+            ],
+        )
+
+        async def send_dm_executor(args: dict[str, Any]) -> ToolResult:
+            if agent_ref._rc_bridge is None:
+                return ToolResult(
+                    tool_use_id="",
+                    content="Error: Rocket.Chat bridge not available",
+                    is_error=True,
+                )
+            username = (args.get("username") or "").strip()
+            message = (args.get("message") or "").strip()
+            if not username or not message:
+                return ToolResult(
+                    tool_use_id="",
+                    content="Error: both username and message are required",
+                    is_error=True,
+                )
+            try:
+                room_id = await agent_ref._rc_bridge.send_dm(username, message)
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"Message sent to {username} (room: {room_id})",
+                )
+            except Exception as exc:
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"Error sending DM to {username}: {exc}",
+                    is_error=True,
+                )
+
+        self.tool_registry.register(send_dm_def, send_dm_executor, group="runtime")
+
+        # -- poll tool --
+        poll_def = ToolDefinition(
+            name="poll",
+            description=(
+                "Send a question to multiple Rocket.Chat users via DM and "
+                "collect their responses. Results are automatically aggregated "
+                "when all users respond or the deadline is reached, and sent "
+                "back to the requesting user's DM room."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="question", type="string",
+                    description="The question to ask each user",
+                ),
+                ToolParameter(
+                    name="usernames", type="string",
+                    description="Comma-separated Rocket.Chat usernames to poll",
+                ),
+                ToolParameter(
+                    name="deadline_minutes", type="integer",
+                    description="Minutes to wait before aggregating (default: 60)",
+                    required=False,
+                ),
+            ],
+        )
+
+        async def poll_executor(args: dict[str, Any]) -> ToolResult:
+            if agent_ref._rc_bridge is None:
+                return ToolResult(
+                    tool_use_id="",
+                    content="Error: Rocket.Chat bridge not available",
+                    is_error=True,
+                )
+            question = (args.get("question") or "").strip()
+            usernames_raw = (args.get("usernames") or "").strip()
+            deadline = int(args.get("deadline_minutes") or 60)
+
+            if not question or not usernames_raw:
+                return ToolResult(
+                    tool_use_id="",
+                    content="Error: question and usernames are required",
+                    is_error=True,
+                )
+
+            usernames = [u.strip() for u in usernames_raw.split(",") if u.strip()]
+            if not usernames:
+                return ToolResult(
+                    tool_use_id="",
+                    content="Error: at least one username is required",
+                    is_error=True,
+                )
+
+            # Determine requester's room from current session
+            session_id = agent_ref._current_session_id
+            if session_id.startswith("rc-"):
+                requester_room = session_id[3:]
+            else:
+                return ToolResult(
+                    tool_use_id="",
+                    content="Error: poll can only be created from a Rocket.Chat session",
+                    is_error=True,
+                )
+
+            try:
+                poll = await agent_ref._rc_bridge.create_poll(
+                    question=question,
+                    usernames=usernames,
+                    requester_room=requester_room,
+                    deadline_minutes=deadline,
+                )
+                sent = [t.username for t in poll.targets.values()]
+                return ToolResult(
+                    tool_use_id="",
+                    content=(
+                        f"Poll '{poll.poll_id}' created.\n"
+                        f"Question: {question}\n"
+                        f"Sent to: {', '.join(sent)}\n"
+                        f"Deadline: {deadline}분\n"
+                        f"Results will be sent to this chat automatically."
+                    ),
+                )
+            except Exception as exc:
+                return ToolResult(
+                    tool_use_id="",
+                    content=f"Error creating poll: {exc}",
+                    is_error=True,
+                )
+
+        self.tool_registry.register(poll_def, poll_executor, group="runtime")
+        log.info("Rocket.Chat tools registered: send_dm, poll")
 
     async def _initial_memory_index(self) -> None:
         """Index existing memory files on first run."""
