@@ -255,22 +255,37 @@ class RocketChatBridge:
             deadline=time.time() + deadline_minutes * 60,
         )
 
-        # Build a contextual message that includes who's asking
-        poll_msg = (
-            f"{requester_name}님이 보낸 설문입니다.\n\n"
-            f"{question}\n\n"
-            f"이 채팅에서 자유롭게 답변해 주세요."
-        )
-
         failed: list[str] = []
         for username in usernames:
             try:
-                room_id = await self.send_dm(username, poll_msg)
+                # Create DM room and seed the agent session with poll context
+                room_id = await self._client.create_dm(username)
+                from datetime import datetime, timezone
+                self._last_ts[room_id] = datetime.now(timezone.utc).isoformat()
+
+                # Run through agent so it has full context for follow-ups
+                prompt = (
+                    f"[설문 진행] {requester_name}님을 대신하여 "
+                    f"{username}님에게 설문을 전달해 주세요.\n\n"
+                    f"질문: {question}\n\n"
+                    f"자연스럽고 친근하게 전달하세요. "
+                    f"유저가 추가 질문을 하면 아는 범위에서 답하고, "
+                    f"모르면 {requester_name}님에게 직접 물어보라고 안내하세요."
+                )
+                result = await self._agent.run(
+                    prompt, session_id=f"rc-{room_id}",
+                )
+                reply = result.text or ""
+                if reply.strip():
+                    await self._client.send_message(room_id, reply)
+                    # Update timestamp past our own message
+                    self._last_ts[room_id] = datetime.now(timezone.utc).isoformat()
+
                 poll.targets[username] = PollTarget(username=username, room_id=room_id)
                 self._poll_rooms[room_id] = poll_id
                 log.info("Poll %s: sent to %s (room %s)", poll_id, username, room_id)
             except Exception:
-                log.warning("Poll %s: failed to DM %s", poll_id, username)
+                log.warning("Poll %s: failed to DM %s", poll_id, username, exc_info=True)
                 failed.append(username)
 
         self._active_polls[poll_id] = poll
