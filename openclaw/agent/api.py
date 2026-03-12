@@ -108,6 +108,8 @@ class Agent:
 
         # Cron task descriptions for persistence (name -> task string)
         self._cron_task_descriptions: dict[str, str] = {}
+        # External notification callbacks: (job_name, text, is_error) -> None
+        self._notification_callbacks: list = []
 
         # Register cron + session_status + browser tools (need agent/scheduler refs)
         self._register_cron_tools()
@@ -486,12 +488,18 @@ class Agent:
         self.tool_registry.register(batch_spawn_def, batch_executor, group="subagent")
 
     def _post_cron_notification(self, job_name: str, text: str, is_error: bool = False) -> None:
-        """Post a cron job result as a message in the 'web' session."""
+        """Post a cron job result as a message in the 'web' session + external channels."""
         from openclaw.agent.types import AgentMessage, TextBlock
 
         session = self._get_session("web")
         session.load()
         session.append(AgentMessage(role="assistant", content=[TextBlock(text=text)]))
+
+        for cb in self._notification_callbacks:
+            try:
+                cb(job_name, text, is_error)
+            except Exception:
+                log.warning("Notification callback failed", exc_info=True)
 
     def _make_cron_callback(self, name: str, task_desc: str, one_shot: bool) -> Any:
         """Build a cron callback closure that runs a task through the agent loop."""

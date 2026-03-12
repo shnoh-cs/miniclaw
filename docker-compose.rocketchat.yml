@@ -1,0 +1,33 @@
+services:
+  mongodb:
+    image: mongo:8.0
+    volumes:
+      - rc_mongo_data:/data/db
+    command: mongod --oplogSize 128 --replSet rs0
+
+  mongo-init-replica:
+    image: mongo:8.0
+    depends_on:
+      - mongodb
+    command: >
+      mongosh --host mongodb --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb:27017'}]})"
+    restart: "no"
+
+  rocketchat:
+    image: registry.rocket.chat/rocketchat/rocket.chat:latest
+    depends_on:
+      - mongodb
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/rocketchat?replicaSet=rs0
+      MONGO_OPLOG_URL: mongodb://mongodb:27017/local?replicaSet=rs0
+      ROOT_URL: https://noh1.hyunwoo.info
+      PORT: "3000"
+      DEPLOY_METHOD: docker
+    ports:
+      - "9101:3000"
+    volumes:
+      - rc_uploads:/app/uploads
+
+volumes:
+  rc_mongo_data:
+  rc_uploads:

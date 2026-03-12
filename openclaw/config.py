@@ -152,6 +152,16 @@ class HooksConfig(BaseModel):
     timeout: int = 10
 
 
+class RocketChatConfig(BaseModel):
+    enabled: bool = False
+    url: str = ""                    # e.g., "http://localhost:3000"
+    user: str = ""                   # bot username
+    password: str = ""               # bot password
+    poll_interval: float = 2.0       # seconds between polls
+    channels: list[str] = Field(default_factory=list)  # channels to monitor
+    notify_channel: str = ""         # channel for cron notifications
+
+
 class AppConfig(BaseModel):
     """Root configuration."""
 
@@ -166,6 +176,7 @@ class AppConfig(BaseModel):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     hooks: HooksConfig = Field(default_factory=HooksConfig)
+    rocketchat: RocketChatConfig = Field(default_factory=RocketChatConfig)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

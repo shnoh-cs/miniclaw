@@ -84,3 +84,12 @@ max_prompt_chars = 30000
 
 [workspace]
 dir = "~/.openclaw-py/workspace"
+
+[rocketchat]
+enabled = true
+url = "http://localhost:9101"        # Rocket.Chat server URL
+user = "openclaw-bot"                # bot account username
+password = "bot-password"            # bot account password
+poll_interval = 2.0                  # seconds between polls
+channels = []                       # channels to monitor (empty = DM only)
+notify_channel = ""                  # channel for cron notifications
