@@ -108,8 +108,12 @@ class Agent:
 
         # Cron task descriptions for persistence (name -> task string)
         self._cron_task_descriptions: dict[str, str] = {}
-        # External notification callbacks: (job_name, text, is_error) -> None
+        # Cron reply-to session mapping (name -> session_id)
+        self._cron_reply_to: dict[str, str] = {}
+        # External notification callbacks: (job_name, text, is_error, reply_to) -> None
         self._notification_callbacks: list = []
+        # Current session_id being processed
+        self._current_session_id: str = "default"
 
         # Register cron + session_status + browser tools (need agent/scheduler refs)
         self._register_cron_tools()
@@ -487,8 +491,10 @@ class Agent:
 
         self.tool_registry.register(batch_spawn_def, batch_executor, group="subagent")
 
-    def _post_cron_notification(self, job_name: str, text: str, is_error: bool = False) -> None:
-        """Post a cron job result as a message in the 'web' session + external channels."""
+    def _post_cron_notification(
+        self, job_name: str, text: str, is_error: bool = False, reply_to: str = "",
+    ) -> None:
+        """Post a cron job result to the originating session + external channels."""
         from openclaw.agent.types import AgentMessage, TextBlock
 
         session = self._get_session("web")
@@ -497,11 +503,13 @@ class Agent:
 
         for cb in self._notification_callbacks:
             try:
-                cb(job_name, text, is_error)
+                cb(job_name, text, is_error, reply_to)
             except Exception:
                 log.warning("Notification callback failed", exc_info=True)
 
-    def _make_cron_callback(self, name: str, task_desc: str, one_shot: bool) -> Any:
+    def _make_cron_callback(
+        self, name: str, task_desc: str, one_shot: bool, reply_to: str = "",
+    ) -> Any:
         """Build a cron callback closure that runs a task through the agent loop."""
         agent_ref = self
         scheduler = self._scheduler
@@ -510,6 +518,7 @@ class Agent:
             _task: str = task_desc,
             _name: str = name,
             _one_shot: bool = one_shot,
+            _reply_to: str = reply_to,
         ) -> None:
             prompt = (
                 f"Scheduled job '{_name}' has fired. "
@@ -526,15 +535,20 @@ class Agent:
                 text = result.text or ""
                 if text.strip().upper() != "NO_REPLY":
                     log.info("Cron '%s' output: %s", _name, text[:200])
-                    agent_ref._post_cron_notification(_name, text)
+                    agent_ref._post_cron_notification(
+                        _name, text, reply_to=_reply_to,
+                    )
             except Exception as exc:
                 log.warning("Cron '%s' failed: %s", _name, exc)
-                agent_ref._post_cron_notification(_name, str(exc), is_error=True)
+                agent_ref._post_cron_notification(
+                    _name, str(exc), is_error=True, reply_to=_reply_to,
+                )
 
             # Auto-delete one-shot jobs after completion
             if _one_shot:
                 scheduler.unregister(_name)
                 agent_ref._cron_task_descriptions.pop(_name, None)
+                agent_ref._cron_reply_to.pop(_name, None)
 
         return _cron_callback
 
@@ -543,7 +557,10 @@ class Agent:
         try:
             from openclaw.cron.persistence import save_jobs
             path = self.workspace / "jobs.json"
-            save_jobs(self._scheduler, self._cron_task_descriptions, path)
+            save_jobs(
+                self._scheduler, self._cron_task_descriptions, path,
+                reply_to_map=self._cron_reply_to,
+            )
         except Exception as exc:
             log.warning("Failed to save cron jobs: %s", exc)
 
@@ -560,12 +577,17 @@ class Agent:
         missed = set(check_missed_jobs(records))
 
         for rec in records:
-            callback = self._make_cron_callback(rec.name, rec.task, rec.one_shot)
+            reply_to = rec.reply_to
+            callback = self._make_cron_callback(
+                rec.name, rec.task, rec.one_shot, reply_to=reply_to,
+            )
             schedule = rec.to_schedule()
             self._scheduler.register(
                 rec.name, callback, schedule=schedule, one_shot=rec.one_shot,
             )
             self._cron_task_descriptions[rec.name] = rec.task
+            if reply_to:
+                self._cron_reply_to[rec.name] = reply_to
 
             # Restore run state
             task_obj = self._scheduler._tasks.get(rec.name)
@@ -590,7 +612,9 @@ class Agent:
         for rec in records:
             if rec.name in missed:
                 log.info("Catching up missed cron job: %s", rec.name)
-                callback = self._make_cron_callback(rec.name, rec.task, rec.one_shot)
+                callback = self._make_cron_callback(
+                    rec.name, rec.task, rec.one_shot, reply_to=rec.reply_to,
+                )
                 import asyncio as _aio
                 _aio.create_task(callback())
 
@@ -683,11 +707,15 @@ class Agent:
                         is_error=True,
                     )
 
-                callback = agent_ref._make_cron_callback(name, task_desc, one_shot)
+                reply_to = agent_ref._current_session_id
+                callback = agent_ref._make_cron_callback(
+                    name, task_desc, one_shot, reply_to=reply_to,
+                )
                 scheduler.register(
                     name, callback, schedule=schedule, one_shot=one_shot,
                 )
                 agent_ref._cron_task_descriptions[name] = task_desc
+                agent_ref._cron_reply_to[name] = reply_to
 
                 # Auto-start scheduler if not running
                 if not scheduler._running:
@@ -891,9 +919,14 @@ class Agent:
         thinking: ThinkingLevel | None = None,
     ) -> RunResult:
         """Run the agent with a user message."""
-        await self._ensure_initialized(session_id)
-        ctx = self._build_context(session_id, thinking)
-        return await run(ctx, message)
+        prev_session = self._current_session_id
+        self._current_session_id = session_id
+        try:
+            await self._ensure_initialized(session_id)
+            ctx = self._build_context(session_id, thinking)
+            return await run(ctx, message)
+        finally:
+            self._current_session_id = prev_session
 
     async def _ensure_initialized(self, session_id: str) -> None:
         """One-time initialization: memory index + session index + curation."""
@@ -931,10 +964,15 @@ class Agent:
         thinking: ThinkingLevel | None = None,
     ):
         """Stream the agent response."""
-        await self._ensure_initialized(session_id)
-        ctx = self._build_context(session_id, thinking)
-        async for chunk in stream_run(ctx, message):
-            yield chunk
+        prev_session = self._current_session_id
+        self._current_session_id = session_id
+        try:
+            await self._ensure_initialized(session_id)
+            ctx = self._build_context(session_id, thinking)
+            async for chunk in stream_run(ctx, message):
+                yield chunk
+        finally:
+            self._current_session_id = prev_session
 
     def tool(
         self,

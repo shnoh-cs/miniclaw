@@ -131,8 +131,23 @@ class RocketChatBridge:
         await self._client.close()
         log.info("Rocket.Chat bridge stopped")
 
-    async def send_notification(self, text: str) -> None:
-        """Send a message to the configured notify channel."""
+    async def send_notification(self, text: str, reply_to: str = "") -> None:
+        """Send a cron notification to the originating room or fallback channel.
+
+        If *reply_to* starts with ``rc-``, the message goes directly to that
+        Rocket.Chat room (the DM where the user created the job).  Otherwise
+        it falls back to the configured ``notify_channel``.
+        """
+        # Route to originating DM room if available
+        if reply_to.startswith("rc-"):
+            room_id = reply_to[3:]
+            try:
+                await self._client.send_message(room_id, text)
+                return
+            except Exception:
+                log.warning("Failed to send cron reply to room %s", room_id)
+                # Fall through to notify_channel
+
         channel = self._config.notify_channel
         if not channel:
             return

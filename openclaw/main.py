@@ -24,7 +24,9 @@ async def run() -> None:
         rc_bridge = RocketChatBridge(agent, agent.config.rocketchat)
         await rc_bridge.start()
         agent._notification_callbacks.append(
-            lambda _name, text, _err: asyncio.create_task(rc_bridge.send_notification(text))
+            lambda _name, text, _err, _reply_to="": asyncio.create_task(
+                rc_bridge.send_notification(text, reply_to=_reply_to)
+            )
         )
         log.info("Rocket.Chat bridge: %s", agent.config.rocketchat.url)
 

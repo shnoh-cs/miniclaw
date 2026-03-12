@@ -28,6 +28,7 @@ class JobRecord:
     created_at: float = 0.0
     last_run: float = 0.0
     run_count: int = 0
+    reply_to: str = ""
 
     def to_schedule(self) -> Schedule:
         return Schedule(
@@ -43,8 +44,11 @@ def save_jobs(
     scheduler: CronScheduler,
     task_descriptions: dict[str, str],
     path: Path,
+    *,
+    reply_to_map: dict[str, str] | None = None,
 ) -> None:
     """Save user-created cron jobs to JSON file."""
+    reply_to_map = reply_to_map or {}
     records: list[dict[str, Any]] = []
     for info in scheduler.status():
         name = info["name"]
@@ -67,6 +71,7 @@ def save_jobs(
             "created_at": getattr(task_obj, "_created_at", time.time()),
             "last_run": task_obj.last_run,
             "run_count": task_obj.run_count,
+            "reply_to": reply_to_map.get(name, ""),
         })
 
     path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -88,6 +93,7 @@ def load_jobs(path: Path) -> list[JobRecord]:
                 created_at=r.get("created_at", 0.0),
                 last_run=r.get("last_run", 0.0),
                 run_count=r.get("run_count", 0),
+                reply_to=r.get("reply_to", ""),
             )
             for r in data
         ]
