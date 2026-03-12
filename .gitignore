@@ -7,3 +7,4 @@ dist/
 build/
 config.toml
 .ruff_cache/
+server.log

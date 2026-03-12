@@ -29,7 +29,6 @@ dev = [
 ]
 
 [project.scripts]
-openclaw-py = "openclaw.repl:main"
 openclaw-serve = "openclaw.server:main"
 
 [build-system]

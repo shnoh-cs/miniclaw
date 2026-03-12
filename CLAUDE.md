@@ -74,8 +74,7 @@ openclaw/
 ├── server.py       229줄  FastAPI 웹 서버 (send+poll 채팅, 크론, 세션 API)
 ├── static/
 │   └── index.html       391줄  단일 파일 채팅 UI (HTML/CSS/JS)
-├── config.py       207줄  TOML 설정 로딩
-└── repl.py         148줄  대화형 REPL (슬림 UI 레이어)
+└── config.py       207줄  TOML 설정 로딩
 ```
 
 ## 핵심 아키텍처
@@ -153,7 +152,6 @@ openclaw/
 cd ~/miniclaw
 source .venv/bin/activate
 pip install -e .
-openclaw-py                           # 대화형 REPL
 openclaw-serve --reload               # 웹 서버 (기본 포트 8089)
 python tests/test_live.py [--offline]  # 테스트 (58개, --offline: 오프라인만)
 ```
