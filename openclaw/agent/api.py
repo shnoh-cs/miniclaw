@@ -976,7 +976,7 @@ class Agent:
                     is_error=True,
                 )
 
-            # Determine requester's room from current session
+            # Determine requester's room and name from current session
             session_id = agent_ref._current_session_id
             if session_id.startswith("rc-"):
                 requester_room = session_id[3:]
@@ -987,10 +987,18 @@ class Agent:
                     is_error=True,
                 )
 
+            requester_name = ""
+            if agent_ref._rc_bridge:
+                requester_name = agent_ref._rc_bridge.get_username_for_room(
+                    requester_room,
+                )
+            requester_name = requester_name or "unknown"
+
             try:
                 poll = await agent_ref._rc_bridge.create_poll(
                     question=question,
                     usernames=usernames,
+                    requester_name=requester_name,
                     requester_room=requester_room,
                     deadline_minutes=deadline,
                 )
