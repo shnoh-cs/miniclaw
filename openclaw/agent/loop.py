@@ -104,6 +104,8 @@ class AgentContext:
     memory_searcher: MemorySearcher | None = None  # for post-flush re-indexing
     auto_recall_context: str = ""  # auto-recalled memory snippets injected per turn
     recovery_checkpoint: str = ""  # post-compaction checkpoint for context recovery
+    prompt_mode: str = "full"  # "full" | "minimal" | "none"
+    extra_system_prompt: str = ""  # appended to system prompt (e.g. subagent context)
 
 
 async def _run_flush_with_tools(ctx: AgentContext, model: str) -> str | None:
@@ -411,7 +413,12 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
             model=model,
             workspace_dir=ctx.workspace_dir,
             compaction_summary=ctx.session.latest_compaction_summary,
+            prompt_mode=ctx.prompt_mode,
         )
+
+        # Inject extra system prompt (e.g. subagent context)
+        if ctx.extra_system_prompt:
+            system_prompt += f"\n\n{ctx.extra_system_prompt}"
 
         # Inject auto-recalled memories
         if ctx.auto_recall_context:
@@ -485,8 +492,18 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
                 tool_calls = parsed_calls
                 accumulated_text = cleaned
 
+        # Debug: log model output for diagnosing missing responses
+        log.info(
+            "Turn %d: text=%r, tool_calls=%d, thinking=%s",
+            turn_count,
+            accumulated_text[:200] if accumulated_text else "(empty)",
+            len(tool_calls),
+            bool(thinking_text),
+        )
+
         # Check NO_REPLY
         if accumulated_text.strip().upper() == NO_REPLY:
+            log.info("Turn %d: NO_REPLY detected, suppressing", turn_count)
             accumulated_text = ""
 
         # Build assistant message
@@ -499,6 +516,8 @@ async def _attempt_loop(ctx: AgentContext, model: str) -> RunResult:
         if assistant_blocks:
             assistant_msg = AgentMessage(role="assistant", content=assistant_blocks)
             ctx.session.append(assistant_msg)
+        else:
+            log.info("Turn %d: empty response (no text, no tools)", turn_count)
 
         result.usage = TokenUsage(
             input_tokens=result.usage.input_tokens + usage.input_tokens,

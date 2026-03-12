@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -14,32 +11,6 @@ import httpx
 from openclaw.config import RocketChatConfig
 
 log = logging.getLogger("openclaw.rocketchat")
-
-
-# ---------------------------------------------------------------------------
-# Poll data structures
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PollTarget:
-    """One user being polled."""
-
-    username: str
-    room_id: str
-
-
-@dataclass
-class ActivePoll:
-    """Tracks a multi-user poll lifecycle."""
-
-    poll_id: str
-    question: str
-    requester_name: str
-    requester_room: str  # room_id to send aggregated results to
-    targets: dict[str, PollTarget] = field(default_factory=dict)
-    deadline: float = 0.0  # unix timestamp
-    completed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -152,10 +123,12 @@ class RocketChatBridge:
         self._channel_ids: dict[str, str] = {}
         # room_id → username (populated from incoming messages)
         self._room_usernames: dict[str, str] = {}
-
-        # Poll tracking
-        self._active_polls: dict[str, ActivePoll] = {}  # poll_id → poll
-        self._poll_rooms: dict[str, str] = {}  # room_id → poll_id
+        # Subagent DM session linking
+        self._dm_session_map: dict[str, str] = {}   # room_id → subagent session_key
+        self._dm_parent_session: dict[str, str] = {}  # room_id → parent session_id
+        self._dm_task: dict[str, str] = {}  # room_id → subagent task description
+        # Per-session locks to prevent concurrent agent.run() on same session
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         await self._client.login(self._config.user, self._config.password)
@@ -222,150 +195,34 @@ class RocketChatBridge:
     async def send_dm(self, username: str, message: str) -> str:
         """Create/get DM with *username* and send *message*. Returns room_id."""
         room_id = await self._client.create_dm(username)
-        await self._client.send_message(room_id, message)
-        # Ensure poller picks up this room and skips the message we just sent
         from datetime import datetime, timezone
+
+        await self._client.send_message(room_id, message)
         self._last_ts[room_id] = datetime.now(timezone.utc).isoformat()
         return room_id
 
-    # ------------------------------------------------------------------
-    # Poll system
-    # ------------------------------------------------------------------
+    def link_dm_session(
+        self, room_id: str, session_key: str, parent_session: str,
+        task: str = "",
+    ) -> None:
+        """Link a DM room to a subagent session.
 
-    async def create_poll(
-        self,
-        question: str,
-        usernames: list[str],
-        requester_name: str,
-        requester_room: str,
-        deadline_minutes: int = 60,
-    ) -> ActivePoll:
-        """Send *question* to each user via DM and track responses.
-
-        Unlike the previous version, polled users have a natural conversation
-        with the agent.  Responses are extracted from session history at the
-        deadline rather than being blindly intercepted.
+        Replies in this room will be routed to *session_key* instead of
+        the default ``rc-{room_id}`` session, and results will be announced
+        back to *parent_session*.
         """
-        poll_id = uuid.uuid4().hex[:8]
-        poll = ActivePoll(
-            poll_id=poll_id,
-            question=question,
-            requester_name=requester_name,
-            requester_room=requester_room,
-            deadline=time.time() + deadline_minutes * 60,
+        self._dm_session_map[room_id] = session_key
+        self._dm_parent_session[room_id] = parent_session
+        self._dm_task[room_id] = task
+        log.info(
+            "DM room %s linked: session=%s, parent=%s",
+            room_id, session_key, parent_session,
         )
 
-        failed: list[str] = []
-        for username in usernames:
-            try:
-                # Create DM room and seed the agent session with poll context
-                room_id = await self._client.create_dm(username)
-                from datetime import datetime, timezone
-                self._last_ts[room_id] = datetime.now(timezone.utc).isoformat()
-
-                # Run through agent so it has full context for follow-ups
-                prompt = (
-                    f"[설문 진행] {requester_name}님을 대신하여 "
-                    f"{username}님에게 설문을 전달해 주세요.\n\n"
-                    f"질문: {question}\n\n"
-                    f"자연스럽고 친근하게 전달하세요. "
-                    f"유저가 추가 질문을 하면 아는 범위에서 답하고, "
-                    f"모르면 {requester_name}님에게 직접 물어보라고 안내하세요."
-                )
-                result = await self._agent.run(
-                    prompt, session_id=f"rc-{room_id}",
-                )
-                reply = result.text or ""
-                if reply.strip():
-                    await self._client.send_message(room_id, reply)
-                    # Update timestamp past our own message
-                    self._last_ts[room_id] = datetime.now(timezone.utc).isoformat()
-
-                poll.targets[username] = PollTarget(username=username, room_id=room_id)
-                self._poll_rooms[room_id] = poll_id
-                log.info("Poll %s: sent to %s (room %s)", poll_id, username, room_id)
-            except Exception:
-                log.warning("Poll %s: failed to DM %s", poll_id, username, exc_info=True)
-                failed.append(username)
-
-        self._active_polls[poll_id] = poll
-
-        # Schedule deadline aggregation
-        delay = deadline_minutes * 60
-        asyncio.create_task(
-            self._poll_deadline(poll_id, delay), name=f"poll-deadline-{poll_id}"
-        )
-
-        if failed:
-            log.warning("Poll %s: could not reach %s", poll_id, ", ".join(failed))
-
-        return poll
-
-    async def _poll_deadline(self, poll_id: str, delay: float) -> None:
-        """Wait for deadline then aggregate responses from session history."""
-        await asyncio.sleep(delay)
-        poll = self._active_polls.get(poll_id)
-        if poll and not poll.completed:
-            log.info("Poll %s: deadline reached, aggregating", poll_id)
-            await self._aggregate_poll(poll_id)
-
-    async def _aggregate_poll(self, poll_id: str) -> None:
-        """Aggregate poll responses from session history and send to requester."""
-        poll = self._active_polls.get(poll_id)
-        if not poll or poll.completed:
-            return
-        poll.completed = True
-
-        # Clean up room mappings
-        for target in poll.targets.values():
-            self._poll_rooms.pop(target.room_id, None)
-
-        # Build conversation summaries from each target's session
-        summaries: list[str] = []
-        for target in poll.targets.values():
-            session_id = f"rc-{target.room_id}"
-            session = self._agent._get_session(session_id)
-            session.load()
-            messages = session.messages()
-
-            # Extract user messages (skip the initial poll question)
-            user_msgs = [
-                m.text_content() for m in messages
-                if m.role == "user"
-            ]
-            if user_msgs:
-                summaries.append(
-                    f"- **{target.username}**: {' / '.join(user_msgs)}"
-                )
-            else:
-                summaries.append(f"- **{target.username}**: (응답 없음)")
-
-        summary_text = "\n".join(summaries)
-        prompt = (
-            f"설문이 마감되었습니다. 아래 응답들을 분석해서 결과를 정리하고, "
-            f"최적의 일정을 추천해 주세요.\n\n"
-            f"질문: {poll.question}\n"
-            f"요청자: {poll.requester_name}\n\n"
-            f"응답:\n{summary_text}"
-        )
-
-        try:
-            result = await self._agent.run(
-                prompt, session_id=f"rc-{poll.requester_room}",
-            )
-            reply = result.text or summary_text
-            await self._client.send_message(poll.requester_room, reply)
-        except Exception:
-            log.exception("Poll %s: aggregation failed, sending raw summary", poll_id)
-            try:
-                await self._client.send_message(
-                    poll.requester_room,
-                    f"**설문 결과** (질문: {poll.question})\n\n{summary_text}",
-                )
-            except Exception:
-                pass
-
-        self._active_polls.pop(poll_id, None)
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
 
     # ------------------------------------------------------------------
     # Main polling loop
@@ -455,11 +312,32 @@ class RocketChatBridge:
         self._processing[room_id] = True
 
         try:
-            session_id = f"rc-{room_id}"
-            result = await self._agent.run(text, session_id=session_id)
-            reply = result.text or ""
-            if reply.strip():
-                await self._client.send_message(room_id, reply)
+            parent_session = self._dm_parent_session.get(room_id)
+
+            if parent_session:
+                # Linked DM room (subagent): don't run agent.run() on
+                # the subagent session — just ack and forward to parent.
+                # This avoids cascading agent calls that produce multiple messages.
+                log.info(
+                    "Linked DM reply in room %s → forwarding to parent %s: %s",
+                    room_id, parent_session, text[:100],
+                )
+                await self._client.send_message(room_id, "답변 감사합니다!")
+                username = self._room_usernames.get(room_id, "unknown")
+                await self._announce_to_parent(
+                    parent_session, username, text,
+                )
+            else:
+                # Normal room: run through agent as usual
+                log.info("Normal message in room %s: %s", room_id, text[:100])
+                session_id = f"rc-{room_id}"
+                async with self._get_session_lock(session_id):
+                    result = await self._agent.run(
+                        text, session_id=session_id,
+                    )
+                reply = result.text or ""
+                if reply.strip():
+                    await self._client.send_message(room_id, reply)
         except Exception:
             log.exception("Failed to handle message in room %s", room_id)
             try:
@@ -468,3 +346,29 @@ class RocketChatBridge:
                 pass
         finally:
             self._processing[room_id] = False
+
+    async def _announce_to_parent(
+        self, parent_session: str, username: str, reply_text: str,
+    ) -> None:
+        """Forward a DM reply to the parent session as a notification."""
+        announce = (
+            f"[서브에이전트 알림] {username}님이 답변했습니다: {reply_text}\n"
+            f"이 알림에 대해 간단히 확인만 해주세요. 추가 작업(서브에이전트 생성, "
+            f"DM 전송 등)은 하지 마세요."
+        )
+        log.info("Announcing to parent %s: %s replied '%s'",
+                 parent_session, username, reply_text[:100])
+        try:
+            async with self._get_session_lock(parent_session):
+                result = await self._agent.run(announce, session_id=parent_session)
+            reply = result.text or ""
+            log.info("Parent response: %s", reply[:200] if reply else "(empty)")
+            # Send the agent's response to the parent's room
+            if parent_session.startswith("rc-") and reply.strip():
+                parent_room = parent_session[3:]
+                await self._client.send_message(parent_room, reply)
+        except Exception:
+            log.exception(
+                "Failed to announce %s's reply to parent session %s",
+                username, parent_session,
+            )

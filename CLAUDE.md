@@ -86,9 +86,19 @@ openclaw/
 - 크론 알림도 `_notification_callbacks`를 통해 Rocket.Chat으로 전송
 - 세션 ID: `rc-{room_id}`로 채널/DM별 독립 세션
 
+### 다중 사용자 DM 워크플로 (서브에이전트 기반)
+- **흐름**: 사용자 요청 → `subagent_batch`로 서브에이전트 생성 → 각 서브에이전트가 `send_dm` 호출 → DM 룸이 서브에이전트 세션에 링크 → 상대방 답변 시 부모 세션에 알림 전달
+- **`_build_subagent_system_prompt()`**: 서브에이전트 전용 시스템 프롬프트 (원본 OpenClaw `buildSubagentSystemPrompt` 포팅)
+- **`send_dm` 가드**: 서브에이전트 세션에서만 호출 가능 (메인 에이전트의 직접 호출 방지)
+- **`link_dm_session()`**: DM 룸 → 서브에이전트 세션 매핑. 답변이 오면 `agent.run()` 없이 즉시 ack + 부모 세션에 전달
+- **`_announce_to_parent()`**: DM 답변을 `[서브에이전트 알림]`으로 부모 세션에 주입 → 부모 에이전트가 응답 집계·조율
+- **`prompt_mode`**: `"full"` | `"minimal"` | `"none"` — 서브에이전트는 `"minimal"` (Identity + Tooling + Safety만)
+- **세션 락**: `_get_session_lock()`으로 동일 세션에 대한 동시 `agent.run()` 방지
+
 ### Agent API (`agent/api.py`)
 - `Agent` 클래스: 모든 기능의 진입점
 - `Agent.from_config()` → `agent.run()` / `agent.stream()` 패턴
+- `agent.run(prompt_mode=, extra_system_prompt=)`: 서브에이전트용 최소 프롬프트 모드 지원
 - `@agent.tool` 데코레이터로 커스텀 도구 등록
 - 에페머럴 세션: `cron-`, `heartbeat` 접두사 세션은 디스크 I/O 없이 메모리만 사용
 
@@ -96,6 +106,7 @@ openclaw/
 - `run()` → `_attempt_loop()` → stream → tool dispatch → re-entry (최대 50턴)
 - 컨텍스트 초과 시 자동 컴팩션·프루닝 적용
 - Hook 연동, 고아 tool_use 감지·합성 결과 주입
+- 턴별 로깅: 모델 출력(text/tool_calls/thinking) 추적으로 빈 응답 진단 지원
 
 ### 지능 기능 (Intelligence Features)
 - **메모리 플러시**: 컴팩션 전 에이전트 루프를 통해 tool access와 함께 기억 저장

@@ -39,8 +39,7 @@ _CORE_TOOL_SUMMARIES: dict[str, str] = {
     "subagent_batch": "Spawn multiple sub-agents in parallel",
     "cron": "Manage cron jobs and wake events (use for reminders and recurring tasks)",
     "session_status": "Show session status: current date/time, model, token usage",
-    "send_dm": "Send a direct message to a Rocket.Chat user (proactive outreach)",
-    "poll": "Poll multiple Rocket.Chat users via DM and aggregate their responses",
+    "send_dm": "Send a direct message to a Rocket.Chat user",
 }
 
 # 도구 표시 순서
@@ -51,7 +50,7 @@ _TOOL_ORDER = [
     "memory_search", "memory_save", "memory_get",
     "subagent", "subagent_batch",
     "cron", "session_status",
-    "send_dm", "poll",
+    "send_dm",
 ]
 
 
@@ -215,10 +214,17 @@ def build_system_prompt(
         "",
         "You are NOT a plain LLM — you are an agent with persistent tools.",
         "When a user asks if something is possible, check your available tools "
-        "before saying no. If a task can be accomplished by combining tools "
-        "(e.g. web_fetch + bash + write for automated reports, cron for "
-        "scheduling, or send_dm/poll for messaging Rocket.Chat users), "
-        "propose and implement the solution.",
+        "before saying no. If a task can be accomplished by combining tools, "
+        "propose and implement the solution. Examples:",
+        "- web_fetch + bash + write → automated reports",
+        "- cron → scheduling, reminders, recurring tasks",
+        "- subagent + send_dm → multi-user DM workflows. Spawn a subagent "
+        "per user; each subagent sends a DM via send_dm and handles "
+        "follow-up conversation independently. Replies are automatically "
+        "announced back to your session.",
+        "- subagent_batch + send_dm → contact multiple users in parallel "
+        "(surveys, scheduling, data collection). Each subagent manages "
+        "one conversation; results flow back as notifications.",
     ]))
 
     # 2. Tooling + Tool Call Style

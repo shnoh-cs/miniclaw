@@ -39,6 +39,51 @@ def _make_tool_executor(mod: Any, workspace: str) -> Any:
     return executor
 
 
+def _build_subagent_system_prompt(
+    *,
+    task: str,
+    child_session_key: str,
+    parent_session_key: str,
+) -> str:
+    """Build the subagent-specific system prompt (ported from OpenClaw original)."""
+    return "\n".join([
+        "# Subagent Context",
+        "",
+        "You are a **subagent** spawned by the main agent for a specific task.",
+        "",
+        "## Your Role",
+        f"- You were created to handle: {task}",
+        "- Complete this task. That's your entire purpose.",
+        "- You are NOT the main agent. Don't try to be.",
+        "",
+        "## Rules",
+        "1. **Stay focused** - Do your assigned task, nothing else.",
+        "2. **Complete the task** - Your final message will be automatically "
+        "reported to the main agent.",
+        "3. **Don't initiate** - No heartbeats, no proactive actions, no side quests.",
+        "4. **Be concise** - Report what you accomplished and relevant details.",
+        "5. **Use send_dm once per user** - When your task involves messaging "
+        "a user, call send_dm exactly once. Do not call it again.",
+        "",
+        "## Output Format",
+        "When complete, your final response should include:",
+        "- What you accomplished or found",
+        "- Any relevant details the main agent should know",
+        "- Keep it concise but informative",
+        "",
+        "## What You DON'T Do",
+        "- NO user conversations (that's the main agent's job)",
+        "- NO cron jobs or persistent state",
+        "- NO pretending to be the main agent",
+        "- Only use send_dm when explicitly tasked with contacting a specific user; "
+        "otherwise return plain text and let the main agent deliver it",
+        "",
+        "## Session Context",
+        f"- Your session: {child_session_key}",
+        f"- Requester session: {parent_session_key}",
+    ])
+
+
 def _register_builtins(registry: ToolRegistry, workspace: str) -> None:
     """Register all built-in tools."""
     from openclaw.tools.builtins import (
@@ -248,6 +293,9 @@ class Agent:
         self,
         session_id: str = "default",
         thinking: ThinkingLevel | None = None,
+        *,
+        prompt_mode: str = "full",
+        extra_system_prompt: str = "",
     ) -> AgentContext:
         session = self._get_session(session_id)
 
@@ -290,6 +338,8 @@ class Agent:
             model=self.config.models.default,
             hook_runner=HookRunner(self.config.hooks),
             memory_searcher=searcher,
+            prompt_mode=prompt_mode,
+            extra_system_prompt=extra_system_prompt,
         )
 
     def _wire_memory_tools(self, searcher: MemorySearcher) -> None:
@@ -393,23 +443,33 @@ class Agent:
                 return ToolResult(tool_use_id="", content="Error: task is required", is_error=True)
 
             # Check spawn limits
-            can, reason = agent_ref._subagent_registry.can_spawn(0, "main")
+            parent_session = agent_ref._current_session_id
+            can, reason = agent_ref._subagent_registry.can_spawn(0, parent_session)
             if not can:
                 return ToolResult(tool_use_id="", content=f"Cannot spawn: {reason}", is_error=True)
 
             # Spawn and run
             entry = agent_ref._subagent_registry.spawn(
-                parent_session_key="main",
+                parent_session_key=parent_session,
                 task=task,
                 depth=0,
                 model=model,
             )
             agent_ref._subagent_registry.mark_running(entry.id)
 
+            # Build subagent-specific system prompt
+            subagent_prompt = _build_subagent_system_prompt(
+                task=task,
+                child_session_key=entry.session_key,
+                parent_session_key=parent_session,
+            )
+
             try:
                 result = await agent_ref.run(
                     task,
                     session_id=entry.session_key,
+                    prompt_mode="minimal",
+                    extra_system_prompt=subagent_prompt,
                 )
                 agent_ref._subagent_registry.mark_completed(
                     entry.id, text=result.text, error=result.error
@@ -456,17 +516,29 @@ class Agent:
             if not tasks or not isinstance(tasks, list):
                 return ToolResult(tool_use_id="", content="Error: tasks must be a non-empty list", is_error=True)
 
+            parent_session = agent_ref._current_session_id
+
             async def run_one(task_desc: str, idx: int) -> str:
                 async with _batch_semaphore:
-                    can, reason = agent_ref._subagent_registry.can_spawn(0, "main")
+                    can, reason = agent_ref._subagent_registry.can_spawn(0, parent_session)
                     if not can:
                         return f"[Task {idx+1}: SKIPPED] {reason}"
                     entry = agent_ref._subagent_registry.spawn(
-                        parent_session_key="main", task=task_desc, depth=0,
+                        parent_session_key=parent_session, task=task_desc, depth=0,
                     )
                     agent_ref._subagent_registry.mark_running(entry.id)
+                    subagent_prompt = _build_subagent_system_prompt(
+                        task=task_desc,
+                        child_session_key=entry.session_key,
+                        parent_session_key=parent_session,
+                    )
                     try:
-                        result = await agent_ref.run(task_desc, session_id=entry.session_key)
+                        result = await agent_ref.run(
+                            task_desc,
+                            session_id=entry.session_key,
+                            prompt_mode="minimal",
+                            extra_system_prompt=subagent_prompt,
+                        )
                         agent_ref._subagent_registry.mark_completed(
                             entry.id, text=result.text, error=result.error
                         )
@@ -869,7 +941,7 @@ class Agent:
         self.tool_registry.register(browser_def, browser_executor, group="web")
 
     def _register_rc_tools(self, bridge: Any) -> None:
-        """Register Rocket.Chat tools (send_dm, poll) — called after bridge init."""
+        """Register Rocket.Chat tools (send_dm) — called after bridge init."""
         from openclaw.agent.types import ToolDefinition, ToolParameter, ToolResult
 
         self._rc_bridge = bridge
@@ -880,7 +952,12 @@ class Agent:
             name="send_dm",
             description=(
                 "Send a direct message to a Rocket.Chat user by username. "
-                "Creates a DM channel if one doesn't exist."
+                "IMPORTANT: This tool can ONLY be called from a subagent. "
+                "To message users, use subagent or subagent_batch to spawn "
+                "a subagent with a task that includes sending the DM. "
+                "The DM room is automatically linked to the subagent's "
+                "session — replies are handled by the subagent and "
+                "announced back to the parent."
             ),
             parameters=[
                 ToolParameter(
@@ -901,6 +978,27 @@ class Agent:
                     content="Error: Rocket.Chat bridge not available",
                     is_error=True,
                 )
+
+            # Guard: send_dm should only be called from a subagent session.
+            # Main agent should use subagent/subagent_batch to spawn a
+            # subagent that calls send_dm.
+            current_session = agent_ref._current_session_id
+            is_subagent = any(
+                e.session_key == current_session
+                for e in agent_ref._subagent_registry._entries.values()
+            )
+            if not is_subagent:
+                return ToolResult(
+                    tool_use_id="",
+                    content=(
+                        "Error: send_dm must be called from a subagent. "
+                        "Use subagent or subagent_batch to spawn a subagent "
+                        "with a task like 'send_dm으로 {username}에게 "
+                        "메시지를 보내고 답변을 수집해줘'."
+                    ),
+                    is_error=True,
+                )
+
             username = (args.get("username") or "").strip()
             message = (args.get("message") or "").strip()
             if not username or not message:
@@ -911,6 +1009,16 @@ class Agent:
                 )
             try:
                 room_id = await agent_ref._rc_bridge.send_dm(username, message)
+
+                # Link DM room to this subagent session
+                for entry in agent_ref._subagent_registry._entries.values():
+                    if entry.session_key == current_session:
+                        agent_ref._rc_bridge.link_dm_session(
+                            room_id, current_session, entry.parent_session_key,
+                            task=entry.task,
+                        )
+                        break
+
                 return ToolResult(
                     tool_use_id="",
                     content=f"Message sent to {username} (room: {room_id})",
@@ -923,105 +1031,7 @@ class Agent:
                 )
 
         self.tool_registry.register(send_dm_def, send_dm_executor, group="runtime")
-
-        # -- poll tool --
-        poll_def = ToolDefinition(
-            name="poll",
-            description=(
-                "Send a question to multiple Rocket.Chat users via DM and "
-                "collect their responses. Results are automatically aggregated "
-                "when all users respond or the deadline is reached, and sent "
-                "back to the requesting user's DM room."
-            ),
-            parameters=[
-                ToolParameter(
-                    name="question", type="string",
-                    description="The question to ask each user",
-                ),
-                ToolParameter(
-                    name="usernames", type="string",
-                    description="Comma-separated Rocket.Chat usernames to poll",
-                ),
-                ToolParameter(
-                    name="deadline_minutes", type="integer",
-                    description="Minutes to wait before aggregating (default: 60)",
-                    required=False,
-                ),
-            ],
-        )
-
-        async def poll_executor(args: dict[str, Any]) -> ToolResult:
-            if agent_ref._rc_bridge is None:
-                return ToolResult(
-                    tool_use_id="",
-                    content="Error: Rocket.Chat bridge not available",
-                    is_error=True,
-                )
-            question = (args.get("question") or "").strip()
-            usernames_raw = (args.get("usernames") or "").strip()
-            deadline = int(args.get("deadline_minutes") or 60)
-
-            if not question or not usernames_raw:
-                return ToolResult(
-                    tool_use_id="",
-                    content="Error: question and usernames are required",
-                    is_error=True,
-                )
-
-            usernames = [u.strip() for u in usernames_raw.split(",") if u.strip()]
-            if not usernames:
-                return ToolResult(
-                    tool_use_id="",
-                    content="Error: at least one username is required",
-                    is_error=True,
-                )
-
-            # Determine requester's room and name from current session
-            session_id = agent_ref._current_session_id
-            if session_id.startswith("rc-"):
-                requester_room = session_id[3:]
-            else:
-                return ToolResult(
-                    tool_use_id="",
-                    content="Error: poll can only be created from a Rocket.Chat session",
-                    is_error=True,
-                )
-
-            requester_name = ""
-            if agent_ref._rc_bridge:
-                requester_name = agent_ref._rc_bridge.get_username_for_room(
-                    requester_room,
-                )
-            requester_name = requester_name or "unknown"
-
-            try:
-                poll = await agent_ref._rc_bridge.create_poll(
-                    question=question,
-                    usernames=usernames,
-                    requester_name=requester_name,
-                    requester_room=requester_room,
-                    deadline_minutes=deadline,
-                )
-                sent = [t.username for t in poll.targets.values()]
-                return ToolResult(
-                    tool_use_id="",
-                    content=(
-                        f"Poll '{poll.poll_id}' created.\n"
-                        f"Question: {question}\n"
-                        f"Sent to: {', '.join(sent)}\n"
-                        f"Deadline: {deadline}분\n"
-                        f"Results will be sent to this chat automatically."
-                    ),
-                )
-            except Exception as exc:
-                return ToolResult(
-                    tool_use_id="",
-                    content=f"Error creating poll: {exc}",
-                    is_error=True,
-                )
-
-        self.tool_registry.register(poll_def, poll_executor, group="runtime")
-        log.info("Rocket.Chat tools registered: send_dm, poll")
+        log.info("Rocket.Chat tools registered: send_dm")
 
     async def _initial_memory_index(self) -> None:
         """Index existing memory files on first run."""
@@ -1075,13 +1085,19 @@ class Agent:
         *,
         session_id: str = "default",
         thinking: ThinkingLevel | None = None,
+        prompt_mode: str = "full",
+        extra_system_prompt: str = "",
     ) -> RunResult:
         """Run the agent with a user message."""
         prev_session = self._current_session_id
         self._current_session_id = session_id
         try:
             await self._ensure_initialized(session_id)
-            ctx = self._build_context(session_id, thinking)
+            ctx = self._build_context(
+                session_id, thinking,
+                prompt_mode=prompt_mode,
+                extra_system_prompt=extra_system_prompt,
+            )
             return await run(ctx, message)
         finally:
             self._current_session_id = prev_session
